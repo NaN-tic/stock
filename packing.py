@@ -4,6 +4,7 @@ from trytond.wizard import Wizard, WizardOSV
 import time
 from trytond.netsvc import LocalService
 import datetime
+from trytond.report import CompanyReport
 
 STATES = {
     'readonly': "state in ('cancel', 'done')",
@@ -226,8 +227,15 @@ class PackingOut(OSV):
     _description = __doc__
     _rec_name = 'code'
 
-    effective_date =fields.DateTime('Effective Date', readonly=True)
-    planned_date = fields.DateTime('Planned Date', readonly=True)
+    effective_date =fields.DateTime(
+        'Effective Date', readonly=True,
+        states={'readonly': "state != 'draft'",},)
+    planned_date = fields.DateTime(
+        'Planned Date', readonly=True,
+        states={'readonly': "state != 'draft'",},)
+    customer_address = fields.Many2One(
+        'partner.address', 'Delivery Address', required=True,
+        states={'readonly': "state != 'draft'",}, on_change=['customer_address',])
     warehouse = fields.Many2One('stock.location', "Warehouse", required=True,
             states={
                 'readonly': "state != 'draft'",
@@ -271,6 +279,13 @@ class PackingOut(OSV):
 
     def default_state(self, cursor, user, context=None):
         return 'draft'
+
+    def on_change_customer_address(self, cursor, user, ids, values, context=None):
+        if not values.get('customer_address'):
+            return {}
+        address_obj = self.pool.get("partner.address")
+        address = address_obj.browse(cursor, user, values['customer_address'], context=context)
+        return {'customer_location': address.partner.customer_location.id}
 
     def get_outgoing_moves(self, cursor, user, ids, name, arg, context=None):
         res = {}
@@ -391,8 +406,10 @@ class PackingOut(OSV):
                     'product': move.product.id,
                     'uom': move.uom.id,
                     'quantity': move.quantity,
-                    'outgoing_packing_out': packing.id,
+                    'packing_out': packing.id,
+                    'type': 'output',
                     'state': 'waiting',
+                    'company': move.company.id,
                     }, context=context)
 
     def set_state_cancel(self, cursor, user, packing_id, context=None):
@@ -519,7 +536,8 @@ class PackingOut(OSV):
             for location in parent_to_locations[move.from_location.id]:
                 qty = self._location_amount(
                     cursor, user, move.uom.id,
-                    processed_data[(move.from_location.id, move.product.id)],
+                    processed_data.get(
+                        (move.from_location.id, move.product.id), []),
                     uom_index, context=context,)
                 location_qties.append((location, qty))
 
@@ -626,3 +644,9 @@ class SelectMove(Wizard):
         return {}
 
 SelectMove()
+
+
+class PackingOutReport(CompanyReport):
+    _name = 'stock.packing.out'
+
+PackingOutReport()

@@ -178,12 +178,16 @@
                     <form string="Customer Packing" col="4">
                         <label name="code"/>
                         <field name="code"/>
-                        <label name="effective_date"/>
-                        <field name="effective_date"/>
+                        <label name="customer_address"/>
+                        <field name="customer_address"/>
                         <label name="warehouse"/>
                         <field name="warehouse"/>
                         <label name="customer_location"/>
                         <field name="customer_location"/>
+                        <label name="planned_date"/>
+                        <field name="planned_date"/>
+                        <label name="effective_date"/>
+                        <field name="effective_date"/>
                         <notebook colspan="4">
                             <page string="Inventory Moves">
                                 <field name="inventory_moves" colspan="4"/>
@@ -232,7 +236,9 @@
                     <tree string="Customer Packings">
                         <field name="code" select="1"/>
                         <field name="state" select="1"/>
+                        <field name="planned_date" select="2"/>
                         <field name="effective_date" select="2"/>
+                        <field name="customer_address"/>
                     </tree>
                 ]]>
             </field>
@@ -493,6 +499,21 @@
             <field name="act_from" ref="packingout_act_ready"/>
             <field name="act_to" ref="packingout_act_cancel"/>
             <field name="signal">cancel</field>
+        </record>
+
+
+        <record model="ir.action.report" id="report_packing_out">
+            <field name="name">Supplier Packing</field>
+            <field name="model">stock.packing.out</field>
+            <field name="report_name">stock.packing.out</field>
+            <field name="report">stock/packing_out.odt</field>
+            <field name="style">company/header_A4.odt</field>
+        </record>
+        <record model="ir.action.keyword"
+         id="report_packing_out_keyword">
+            <field name="keyword">form_print</field>
+            <field name="model">stock.packing.out,0</field>
+            <field name="action" ref="report_packing_out"/>
         </record>
 
     </data>
