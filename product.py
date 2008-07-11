@@ -17,16 +17,13 @@ class Product(OSV):
     def get_quantity(self, cursor, user, ids, name, args, context=None):
         if not (context and context.get('locations')):
             return dict([(id, 0.0) for id in ids])
-        location_ids = self.pool.get('stock.location').search(
-            cursor, user, [('parent', 'child_of', context['locations'])],
-            context=context)
         if name != 'forecast_quantity' and context.get('stock_date'):
             if context['stock_date'] != datetime.date.today():
                 context = context.copy()
                 context['stock_date'] = datetime.date.today()
-        pbl = self.products_by_location(
-            cursor, user, location_ids=location_ids, product_ids=ids,
-            context=context)
+        pbl = self.products_by_location(cursor, user,
+                location_ids=context['locations'], product_ids=ids,
+                with_childs=True, context=context)
         res = {}
         for product_id in ids:
             res[product_id] = 0.0
@@ -34,7 +31,7 @@ class Product(OSV):
             res[line['product']] += line['quantity']
         return res
 
-    def _eval_domain(self, line, domain):
+    def _search_quantity_eval_domain(self, line, domain):
         res = True
         for field, operator, operand in domain:
             value = line.get(field)
@@ -50,13 +47,16 @@ class Product(OSV):
     def search_quantity(self, cursor, user, name, domain=[], context=None):
         if not (context and context.get('locations')):
             return []
-        location_ids = self.pool.get('stock.location').search(
-            cursor, user, [('parent', 'child_of', context['locations'])],
-            context=context)
+
+        pbl = self.products_by_location(cursor, user,
+                location_ids=context['locations'],
+                forecast=(name == 'forecast_quantity'), with_childs=True,
+                context=context)
+
         if name == 'forecast_quantity':
-            pbl = self.products_by_location(
-                cursor, user, location_ids=location_ids,
-                skip_zero=False, context=context)
+            pbl = self.products_by_location(cursor, user,
+                    location_ids=context['locations'], with_childs=True,
+                    skip_zero=False, context=context)
             for line in pbl:
                 line['forecast_quantity'] = line['quantity']
                 del line['quantity']
@@ -65,23 +65,26 @@ class Product(OSV):
                 if context['stock_date'] != datetime.date.today():
                     context = context.copy()
                     del context['stock_date']
-            pbl = self.products_by_location(
-                cursor, user, location_ids=location_ids,
-                skip_zero=False, context=context)
+            pbl = self.products_by_location(cursor, user,
+                    location_ids=context['locations'], with_childs=True,
+                    skip_zero=False, context=context)
         res= [line['product'] for line in pbl \
-                    if self._eval_domain(line, domain)]
+                    if self._search_quantity_eval_domain(line, domain)]
         return [('id', 'in', res)]
 
 
     def raw_products_by_location(self, cursor, user, location_ids,
-            product_ids=None,  context=None):
+            product_ids=None, with_childs=False, context=None):
         """
         Return a list like : [(location, product, uom, qty)] for each
-        location and product given as argument. Null qty are not
-        returned and the tuple (location, product,uom) is unique. The
-        key stock_date in context can be used to compute stock for
+        location and product given as argument.
+        Null qty are not returned and the tuple (location, product,uom)
+        is unique.
+        If with_childs, childs location are also computed.
+        The key stock_date in context can be used to compute stock for
         other date than today.
         """
+        location_obj = self.pool.get('stock.location')
         if not location_ids:
             return []
 
@@ -103,20 +106,27 @@ class Product(OSV):
                         "sum(quantity) AS quantity "\
                     "FROM stock_move "\
                     "WHERE state IN (%s) " \
-                        "AND to_%s "\
+                        "AND to_location %s "\
                     "GROUP BY to_location, product ,uom "\
                     "UNION  "\
                     "SELECT from_location AS location, product, uom, "\
                         "-sum(quantity) AS quantity "\
                     "FROM stock_move "\
                     "WHERE state IN (%s) " \
-                        "AND from_%s "\
+                        "AND from_location %s "\
                     "GROUP BY from_location, product, uom "\
                 ") AS T GROUP BY T.location, T.product, T.uom"
 
-        where_clause = "location IN (" + \
-            ",".join(["%s" for i in location_ids]) + ") "
-        where_vals = location_ids[:]
+        if with_childs:
+            query, args = location_obj.search(cursor, user, [
+                ('parent', 'child_of', location_ids),
+                ], context=context, query_string=True)
+            where_clause = " IN (" + query + ") "
+            where_vals = args
+        else:
+            where_clause = " IN (" + \
+                ",".join(["%s" for i in location_ids]) + ") "
+            where_vals = location_ids[:]
 
         where_clause += " AND " + move_query + " "
         where_vals += move_val
@@ -144,13 +154,15 @@ class Product(OSV):
         return cursor.fetchall()
 
     def products_by_location(self, cursor, user, location_ids,
-                            product_ids=None, skip_zero=True, context=None):
+            product_ids=None, with_childs=False, skip_zero=True, context=None):
         """
-        Return a list like : [{location: 1, product: 1, uom: 1, qty:
-        2}] for each location and product given as argument. The key
-        stock_date in context can be used to compute stock for other
-        date than today. If skip_zero, list item with quantity equal
-        to zero are not returned.
+        Return a list like :
+            [{location: 1, product: 1, uom: 1, qty: 2}]
+            for each location and product given as argument.
+        The key stock_date in context can be used to compute stock for other
+        date than today.
+        If with_childs, childs locations are also computed.
+        If skip_zero, list item with quantity equal to zero are not returned.
         """
         uom_obj = self.pool.get("product.uom")
         product_obj = self.pool.get("product.product")
@@ -158,26 +170,27 @@ class Product(OSV):
         if not location_ids:
             return []
 
-        if not product_ids:
-            product_ids = product_obj.search(cursor, user, [], context=context)
-        else:
-            product_ids = product_ids[:]
+        res = {}
+        raw_lines = self.raw_products_by_location(cursor, user, location_ids,
+                product_ids, with_childs=with_childs, context=context)
 
-        uom_ids = uom_obj.search(cursor, user, [], context=context)
-        uom_by_id = dict((x.id, x) for x in uom_obj.browse(
-                cursor, user, uom_ids, context=context))
-        default_uom = dict((p.id, p.default_uom) for p in product_obj.browse(
+        uom_ids = []
+        product_ids = []
+        for line in raw_lines:
+            uom_ids.append(line[2])
+            product_ids.append(line[1])
+
+        uom_by_id = dict([(x.id, x) for x in uom_obj.browse(
+                cursor, user, uom_ids, context=context)])
+        default_uom = dict((x.id, x.default_uom) for x in product_obj.browse(
                 cursor, user, product_ids, context=context))
 
-        res_dict = {}
-        for line in self.raw_products_by_location(
-            cursor, user, location_ids, product_ids, context=context):
-            location, product, uom, quantity= line
+        for line in raw_lines:
+            location, product, uom, quantity = line
             key = (location, product, default_uom[product].id)
-            res_dict.setdefault(key, 0.0)
-            res_dict[key] += uom_obj.compute_qty(
-                cursor, user, uom_by_id[uom], quantity,
-                default_uom[product], context=context)
+            res.setdefault(key, 0.0)
+            res[key] += uom_obj.compute_qty(cursor, user, uom_by_id[uom],
+                    quantity, default_uom[product], context=context)
             # Remove seen products from product_ids
             if key[1] in product_ids:
                 product_ids.remove(key[1])
@@ -185,15 +198,18 @@ class Product(OSV):
         res = [{'location': key[0],
                  'product': key[1],
                  'uom': key[2],
-                 'quantity': val} for key, val in res_dict.iteritems()]
+                 'quantity': val} for key, val in res.iteritems()]
+
         # Complete result with missing products if asked
         if not skip_zero:
             for location_id in location_ids:
                 for product_id in product_ids:
-                    res.append({'location': location_id,
-                               'product': product_id,
-                               'uom': default_uom[product_id].id,
-                               'quantity': 0.0})
+                    res.append({
+                        'location': location_id,
+                        'product': product_id,
+                        'uom': default_uom[product_id].id,
+                        'quantity': 0.0,
+                        })
 
         return res
 

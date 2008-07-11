@@ -136,11 +136,12 @@ class InventoryLine(OSV):
     _description = __doc__
     _rec_name = 'product'
 
-    product = fields.Many2One(
-        'product.product', 'Product', required=True, on_change=['product'])
-    uom = fields.Many2One('product.uom', 'Uom', required=True, select=1)
-    expected_quantity = fields.Float(
-        'Expected Quantity', digits=(12, 6), readonly=True)
+    product = fields.Many2One('product.product', 'Product', required=True,
+            on_change=['product'])
+    uom = fields.Many2One('product.uom', 'UOM', required=True, select=1,
+            readonly=True)
+    expected_quantity = fields.Float('Expected Quantity', digits=(12, 6),
+            readonly=True)
     quantity = fields.Float('Quantity', digits=(12, 6))
     inventory = fields.Many2One('stock.inventory', 'Inventory')
 
@@ -241,4 +242,5 @@ class CompleteInventory(Wizard):
                     cursor, user, values, context=context)
 
         return {}
+
 CompleteInventory()
