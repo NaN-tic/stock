@@ -1,4 +1,5 @@
-#This file is part of Tryton.  The COPYRIGHT file at the top level of this repository contains the full copyright notices and license terms.
+#This file is part of Tryton.  The COPYRIGHT file at the top level of
+#this repository contains the full copyright notices and license terms.
 "Packing"
 from trytond.osv import fields, OSV
 from trytond.netsvc import LocalService
@@ -16,17 +17,17 @@ class PackingIn(OSV):
     _description = __doc__
     _rec_name = 'code'
 
-    effective_date =fields.DateTime('Effective Date', readonly=True)
+    effective_date = fields.DateTime('Effective Date', readonly=True)
     planned_date = fields.DateTime(
         'Planned Date', states={'readonly': "state != 'draft'",})
     reference = fields.Char(
         "Reference", size=None, select=1,
         states={'readonly': "state != 'draft'",})
-    supplier = fields.Many2One('relationship.party', 'Supplier',
+    supplier = fields.Many2One('party.party', 'Supplier',
             states={
                 'readonly': "state != 'draft' or bool(incoming_moves)",
             }, on_change=['supplier'], required=True)
-    contact_address = fields.Many2One('relationship.address', 'Contact Address',
+    contact_address = fields.Many2One('party.address', 'Contact Address',
             states={
                 'readonly': "state != 'draft'",
             }, domain="[('party', '=', supplier)]")
@@ -86,7 +87,7 @@ class PackingIn(OSV):
     def on_change_supplier(self, cursor, user, ids, values, context=None):
         if not values.get('supplier'):
             return {}
-        party_obj = self.pool.get("relationship.party")
+        party_obj = self.pool.get("party.party")
         address_id = party_obj.address_get(cursor, user, values['supplier'],
                                           context=context)
         return {'contact_address': address_id}
@@ -180,8 +181,9 @@ class PackingIn(OSV):
     def set_state_done(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_done(
-            cursor, user, [m.id for m in packing.inventory_moves], context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.inventory_moves],
+            {'state': 'done'}, context)
         self.write(cursor, user, packing_id,{
             'state': 'done',
             'effective_date': datetime.datetime.now(),
@@ -190,17 +192,19 @@ class PackingIn(OSV):
     def set_state_cancel(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_cancel(
+        move_obj.write(
             cursor, user, [m.id for m in packing.incoming_moves] +\
-            [m.id for m in packing.inventory_moves], context)
+            [m.id for m in packing.inventory_moves], {'state': 'cancel'},
+            context)
         self.write(cursor, user, packing_id, {'state':'cancel'},
                    context=context)
 
     def set_state_received(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_done(cursor, user,
-                [m.id for m in packing.incoming_moves], context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.incoming_moves],
+            {'state': 'done'}, context=context)
         self.write(cursor, user, packing_id, {
             'state': 'received'
             }, context=context)
@@ -208,8 +212,12 @@ class PackingIn(OSV):
     def set_state_draft(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_draft(cursor, user,
-                [m.id for m in packing.incoming_moves], context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.incoming_moves],
+            {'state': 'cancel'}, context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.incoming_moves],
+            {'state': 'draft'}, context=context)
         move_obj.delete(cursor, user,
                 [m.id for m in packing.inventory_moves], context=context)
         self.write(cursor, user, packing_id, {
@@ -250,7 +258,8 @@ class PackingIn(OSV):
     def button_draft(self, cursor, user, ids, context=None):
         workflow_service = LocalService('workflow')
         for packing in self.browse(cursor, user, ids, context=context):
-            workflow_service.trg_create(user, self._name, packing.id, cursor)
+            workflow_service.trg_create(user, self._name, packing.id, cursor,
+                    context=context)
         return True
 
 PackingIn()
@@ -267,11 +276,11 @@ class PackingOut(OSV):
             states={
                 'readonly': "state != 'draft'",
             })
-    customer = fields.Many2One('relationship.party', 'Customer', required=True,
+    customer = fields.Many2One('party.party', 'Customer', required=True,
             states={
                 'readonly': "state != 'draft'",
             }, on_change=['customer'])
-    delivery_address = fields.Many2One('relationship.address',
+    delivery_address = fields.Many2One('party.address',
             'Delivery Address', required=True,
             states={
                 'readonly': "state != 'draft'",
@@ -325,7 +334,7 @@ class PackingOut(OSV):
     def on_change_customer(self, cursor, user, ids, values, context=None):
         if not values.get('customer'):
             return {}
-        party_obj = self.pool.get("relationship.party")
+        party_obj = self.pool.get("party.party")
         address_id = party_obj.address_get(cursor, user, values['customer'],
                 type='delivery', context=context)
         party = party_obj.browse(cursor, user, values['customer'], context=context)
@@ -431,17 +440,21 @@ class PackingOut(OSV):
         packing = self.browse(cursor, user, packing_id, context=context)
         self.write(
             cursor, user, packing_id, {'state':'draft'}, context=context)
-        move_obj.set_state_draft(
+        move_obj.write(
             cursor, user,
             [m.id for m in packing.inventory_moves + packing.outgoing_moves],
-            context=context)
+            {'state': 'cancel'}, context=context)
+        move_obj.write(
+            cursor, user,
+            [m.id for m in packing.inventory_moves + packing.outgoing_moves],
+            {'state': 'draft'}, context=context)
 
     def set_state_done(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_done(cursor, user,
+        move_obj.write(cursor, user,
             [m.id for m in packing.outgoing_moves if m.state == 'draft'],
-            context=context)
+            {'state': 'done'}, context=context)
         self.write(cursor, user, packing_id, {
             'state':'done',
             'effective_date': datetime.datetime.now(),
@@ -451,9 +464,9 @@ class PackingOut(OSV):
         move_obj = self.pool.get('stock.move')
         uom_obj = self.pool.get('product.uom')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_done(
+        move_obj.write(
             cursor, user, [m.id for m in packing.inventory_moves],
-            context=context)
+            {'state': 'done'}, context=context)
         self.write(cursor, user, packing_id, {'state':'packed'},
                    context=context)
         # Sum all outgoing quantities
@@ -523,10 +536,10 @@ class PackingOut(OSV):
     def set_state_cancel(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_cancel(
+        move_obj.write(
             cursor, user,[m.id for m in packing.outgoing_moves] +\
                 [m.id for m in packing.inventory_moves],
-            context=context)
+            {'state': 'cancel'}, context=context)
         self.write(cursor, user, packing_id, {'state':'cancel'},
                    context=context)
 
@@ -538,6 +551,15 @@ class PackingOut(OSV):
         move_obj = self.pool.get('stock.move')
         uom_obj = self.pool.get('product.uom')
         packing = self.browse(cursor, user, packing_id, context=context)
+        if packing.state == 'assigned':
+            move_obj.write(
+                cursor, user,
+                [m.id for m in packing.inventory_moves + packing.outgoing_moves],
+                {'state': 'cancel'}, context=context)
+            move_obj.write(
+                cursor, user,
+                [m.id for m in packing.inventory_moves + packing.outgoing_moves],
+                {'state': 'draft'}, context=context)
         self.write(
             cursor, user, packing_id, {'state':'waiting'}, context=context)
 
@@ -620,7 +642,8 @@ class PackingOut(OSV):
     def button_draft(self, cursor, user, ids, context=None):
         workflow_service = LocalService('workflow')
         for packing in self.browse(cursor, user, ids, context=context):
-            workflow_service.trg_create(user, self._name, packing.id, cursor)
+            workflow_service.trg_create(user, self._name, packing.id, cursor,
+                    context=context)
 
 PackingOut()
 
@@ -639,15 +662,16 @@ class PackingInternal(OSV):
         states={'readonly': "state != 'draft'",})
     from_location = fields.Many2One(
         'stock.location', "From Location", required=True,
-        states={ 'readonly': "state != 'draft'", },
+        states={ 'readonly': "state != 'draft' or bool(moves)", },
         domain="[('type', '=', 'storage')]", )
     to_location = fields.Many2One('stock.location', "To Location",
             required=True, states={
-                'readonly': "state != 'draft'",
+                'readonly': "state != 'draft' or bool(moves)",
             }, domain="[('type', '=', 'storage')]")
     moves = fields.One2Many(
         'stock.move', 'packing_internal', 'Moves',
-        states={'readonly': "state != 'draft'"},
+        states={'readonly': "state != 'draft' or "\
+                    "not(bool(from_location) and bool (to_location))"},
         context="{'from_location': from_location,"
                 "'to_location': to_location,"
                 "'planned_date': planned_date}",
@@ -666,7 +690,8 @@ class PackingInternal(OSV):
     def button_draft(self, cursor, user, ids, context=None):
         workflow_service = LocalService('workflow')
         for packing in self.browse(cursor, user, ids, context=context):
-            workflow_service.trg_create(user, self._name, packing.id, cursor)
+            workflow_service.trg_create(user, self._name, packing.id, cursor,
+                    context=context)
         return True
 
     def __init__(self):
@@ -681,12 +706,22 @@ class PackingInternal(OSV):
         packing = self.browse(cursor, user, packing_id, context=context)
         self.write(
             cursor, user, packing_id, {'state':'draft'}, context=context)
-        move_obj.set_state_draft(
-            cursor, user, [m.id for m in packing.moves], context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'cancel'},
+            context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'draft'},
+            context=context)
 
     def set_state_waiting(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'cancel'},
+            context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'draft'},
+            context=context)
         move_obj.write(
             cursor, user, [m.id for m in packing.moves],
             {'planned_date': packing.planned_date}, context=context)
@@ -700,8 +735,9 @@ class PackingInternal(OSV):
     def set_state_done(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_done(
-            cursor, user, [m.id for m in packing.moves], context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'done'},
+            context=context)
         self.write( cursor, user, packing_id,
                     {'state':'done',
                      'effective_date': datetime.datetime.now()},
@@ -710,8 +746,9 @@ class PackingInternal(OSV):
     def set_state_cancel(self, cursor, user, packing_id, context=None):
         move_obj = self.pool.get('stock.move')
         packing = self.browse(cursor, user, packing_id, context=context)
-        move_obj.set_state_cancel(
-            cursor, user, [m.id for m in packing.moves], context=context)
+        move_obj.write(
+            cursor, user, [m.id for m in packing.moves], {'state': 'cancel'},
+            context=context)
         self.write(
             cursor, user, packing_id, {'state':'cancel'}, context=context)
 
@@ -730,8 +767,9 @@ class PackingInternal(OSV):
 
 PackingInternal()
 
+
 class Address(OSV):
-    _name = 'relationship.address'
+    _name = 'party.address'
     delivery = fields.Boolean('Delivery')
 
 Address()

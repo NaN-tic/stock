@@ -25,21 +25,19 @@ class Inventory(OSV):
         'stock.location', 'Lost and Found', required=True,
         domain="[('type', '=', 'lost_found')]", states=STATES)
     lines = fields.One2Many(
-        'stock.inventory.line', 'inventory', 'Inventory Lines', states=STATES)
+        'stock.inventory.line', 'inventory', 'Lines', states=STATES)
     moves = fields.Many2Many(
         'stock.move', 'inventory_move_rel', 'inventory', 'move',
-        'Generated moves')
+        'Moves')
     company = fields.Many2One(
         'company.company', 'Company', required=True, states={
             'readonly': "state != 'open' or bool(lines)",
         })
-
-
-    state = fields.Selection(
-        [('open','Open'),
-         ('done','Done'),
-         ('cancel','Cancel')],
-        'State', readonly=True, select=1)
+    state = fields.Selection([
+        ('open', 'Open'),
+        ('done', 'Done'),
+        ('cancel', 'Cancel'),
+        ], 'State', readonly=True, select=1)
 
     def __init__(self):
         super(Inventory, self).__init__()
@@ -58,11 +56,13 @@ class Inventory(OSV):
         return date_obj.today(cursor, user, context=context)
 
     def default_company(self, cursor, user, context=None):
+        company_obj = self.pool.get('company.company')
+        if context is None:
+            context = {}
         if context.get('company'):
-            return context.get('company')
-        user_obj = self.pool.get('res.user')
-        user = user_obj.browse(cursor, user, user, context=context)
-        return user.company.id
+            return company_obj.name_get(cursor, user, context['company'],
+                    context=context)[0]
+        return False
 
     def set_state_cancel(self, cursor, user, ids, context=None):
         self.write(cursor, user, ids, {
@@ -84,16 +84,15 @@ class Inventory(OSV):
         inventories = self.browse(cursor, user, ids, context=context)
         move_ids = \
             [move.id for inventory in inventories for move in inventory.moves]
-        return move_obj.set_state_cancel(cursor, user, move_ids, context=context)
+        return move_obj.write(cursor, user, move_ids, {
+            'state': 'cancel',
+            }, context=context)
 
     def _done(self, cursor, user, ids, context=None):
-        product_obj = self.pool.get('product.product')
         move_obj = self.pool.get('stock.move')
         date_obj = self.pool.get('ir.date')
 
         inventories = self.browse(cursor, user, ids, context=context)
-        location_ids = []
-        inv_by_loc = {}
 
         for inventory in inventories:
             if inventory.state != 'open':
@@ -125,6 +124,16 @@ class Inventory(OSV):
                     'moves': [('add', x) for x in moves],
                     }, context=context)
 
+    def create(self, cursor, user, vals, context=None):
+        new_id = super(Inventory, self).create(cursor, user, vals,
+                context=context)
+        if 'state' in vals:
+            if vals['state'] == 'done':
+                self._done(cursor, user, [new_id], context=context)
+            elif vals['state'] == 'cancel':
+                self._cancel(cursor, user, [new_id], context=context)
+        return new_id
+
     def write(self, cursor, user, ids, vals, context=None):
         if 'state' in vals:
             if vals['state'] == 'done':
@@ -144,32 +153,40 @@ class InventoryLine(OSV):
     _rec_name = 'product'
 
     product = fields.Many2One('product.product', 'Product', required=True,
-            domain=[('type', '=', 'stockable')])
+            domain=[('type', '=', 'stockable')], on_change=['product'])
     uom = fields.Function('get_uom', type='many2one', relation='product.uom',
-            string='UOM', on_change_with=['product'])
-    expected_quantity = fields.Float('Expected Quantity', digits=(12, 6),
-            readonly=True)
-    quantity = fields.Float('Quantity', digits=(12, 6))
+            string='UOM')
+    unit_digits = fields.Function('get_unit_digits', type='integer',
+            string='Unit Digits')
+    expected_quantity = fields.Float('Expected Quantity',
+            digits="(16, unit_digits)", readonly=True)
+    quantity = fields.Float('Quantity', digits="(16, unit_digits)")
     inventory = fields.Many2One('stock.inventory', 'Inventory')
 
     def __init__(self):
         super(InventoryLine, self).__init__()
         self._sql_constraints += [
             ('check_line_qty_pos',
-                'CHECK(quantity >= 0.0)', 'Move quantity must be positive'),
+                'CHECK(quantity >= 0.0)', 'Line quantity must be positive!'),
             ('inventory_product_uniq', 'UNIQUE(inventory, product)',
                 'Product must be unique by inventory!'),
         ]
 
-    def on_change_with_uom(self, cursor, user, ids, vals, context=None):
+    def default_unit_digits(self, cursor, user, context=None):
+        return 2
+
+    def on_change_product(self, cursor, user, ids, vals, context=None):
         product_obj = self.pool.get('product.product')
         uom_obj = self.pool.get('product.uom')
+        res = {}
+        res['unit_digits'] = 2
         if vals.get('product'):
             product = product_obj.browse(cursor, user, vals['product'],
                     context=context)
-            return uom_obj.name_get(cursor, user, product.default_uom.id,
+            res['uom'] = uom_obj.name_get(cursor, user, product.default_uom.id,
                     context=context)[0]
-        return False
+            res['unit_digits'] = product.default_uom.digits
+        return res
 
     def get_uom(self, cursor, user, ids, name, arg, context=None):
         uom_obj = self.pool.get('product.uom')
@@ -182,6 +199,12 @@ class InventoryLine(OSV):
             uom2name[uom_id] = (uom_id, name)
         for line_id in res:
             res[line_id] = uom2name[res[line_id]]
+        return res
+
+    def get_unit_digits(self, cursor, user, ids, name, arg, context=None):
+        res = {}
+        for line in self.browse(cursor, user, ids, context=context):
+            res[line.id] = line.product.default_uom.digits
         return res
 
 InventoryLine()
