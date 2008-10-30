@@ -21,18 +21,18 @@ major_version, minor_version, _ = info.get('version', '0.0.1').split('.', 2)
 requires.append('trytond >= %s.%s' % (major_version, minor_version))
 requires.append('trytond < %s.%s' % (major_version, str(int(minor_version) + 1)))
 
-setup(name='trytond_' + info['name'].lower(),
+setup(name='trytond_stock',
     version=info.get('version', '0.0.1'),
     description=info.get('description', ''),
     author=info.get('author', ''),
     author_email=info.get('email', ''),
     url=info.get('website', ''),
-    package_dir={'trytond.modules.' + info['name'].lower(): '.'},
+    package_dir={'trytond.modules.stock': '.'},
     packages=[
-        'trytond.modules.' + info['name'].lower(),
+        'trytond.modules.stock',
     ],
     package_data={
-        'trytond.modules.' + info['name'].lower(): info.get('xml', []) \
+        'trytond.modules.stock': info.get('xml', []) \
                 + info.get('translation', []) \
                 + ['packing_out.odt'],
     },
