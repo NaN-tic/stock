@@ -17,13 +17,13 @@ class Inventory(OSV):
 
     location = fields.Many2One(
         'stock.location', 'Location', required=True,
-        domain="[('type', '=', 'storage')]", states={
+        domain=[('type', '=', 'storage')], states={
             'readonly': "state != 'draft' or bool(lines)",
         })
     date = fields.Date('Date', states=STATES)
     lost_found = fields.Many2One(
         'stock.location', 'Lost and Found', required=True,
-        domain="[('type', '=', 'lost_found')]", states=STATES)
+        domain=[('type', '=', 'lost_found')], states=STATES)
     lines = fields.One2Many(
         'stock.inventory.line', 'inventory', 'Lines', states=STATES)
     company = fields.Many2One(
@@ -56,6 +56,15 @@ class Inventory(OSV):
                     context=context)[0]
         return False
 
+    def default_lost_found(self, cursor, user, context=None):
+        location_obj = self.pool.get('stock.location')
+        location_ids = location_obj.search(cursor, user,
+                self.lost_found._domain, context=context)
+        if len(location_ids) == 1:
+            return location_obj.name_get(cursor, user, location_ids,
+                    context=context)[0]
+        return False
+
     def set_state_cancel(self, cursor, user, ids, context=None):
         self.write(cursor, user, ids, {
             'state': 'cancel',
@@ -83,19 +92,27 @@ class Inventory(OSV):
             line_obj.create_move(cursor, user, line, context=context)
         self.write(
             cursor, user, inventory_id,
-            {'date': date_obj.today(cursor, user, context=context)},
+            {'state': 'done',
+             'date': date_obj.today(cursor, user, context=context)},
             context=context)
-        self.write(
-            cursor, user, inventory_id, {'state': 'done',}, context=context)
 
     def copy(self, cursor, user, inventory_id, default=None, context=None):
         date_obj = self.pool.get('ir.date')
+        line_obj = self.pool.get('stock.inventory.line')
         if default is None:
             default = {}
         default = default.copy()
         default['date'] = date_obj.today(cursor, user, context=context)
+        default['lines'] = False
         new_id = super(Inventory, self).copy(
             cursor, user, inventory_id, default=default, context=context)
+        inventory = self.browse(cursor, user, inventory_id, context=context)
+        for line in inventory.lines:
+            line_obj.copy(
+                cursor, user, line.id, default={
+                    'inventory': new_id,
+                    'move': False},
+                context=context)
         self.complete_lines(cursor, user, [new_id], context=context)
         return new_id
 
@@ -182,7 +199,7 @@ class InventoryLine(OSV):
             digits="(16, unit_digits)", readonly=True)
     quantity = fields.Float('Quantity', digits="(16, unit_digits)")
     move = fields.Many2One('stock.move', 'Move', readonly=True)
-    inventory = fields.Many2One('stock.inventory', 'Inventory')
+    inventory = fields.Many2One('stock.inventory', 'Inventory', required=True)
 
     def __init__(self):
         super(InventoryLine, self).__init__()
@@ -238,15 +255,6 @@ class InventoryLine(OSV):
         self.write(
             cursor, user, [l.id for l in lines if l.move], {'move': False},
             context=context)
-
-    def copy(self, cursor, user, line_id, default=None, context=None):
-        if default is None:
-            default = {}
-        default = default.copy()
-        default['inventory']= False
-        default['move'] = False
-        return super(InventoryLine, self).copy(cursor, user, line_id,
-                default=default, context=context)
 
     def create_move(self, cursor, user, line, context=None):
         move_obj = self.pool.get('stock.move')
