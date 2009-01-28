@@ -366,6 +366,18 @@ this repository contains the full copyright notices and license terms. -->
                 ]]>
             </field>
         </record>
+
+        <record model="ir.action.wizard" id="create_packing_out_return">
+            <field name="name">Create Return Packing</field>
+            <field name="wiz_name">stock.packing.out.return.create</field>
+            <field name="model">stock.packing.out</field>
+        </record>
+        <record model="ir.action.keyword" id="create_packing_out_return_keyword">
+            <field name="keyword">form_action</field>
+            <field name="model">stock.packing.out,0</field>
+            <field name="action" ref="create_packing_out_return"/>
+        </record>
+
         <record model="ir.action.act_window" id="act_packing_out_form">
             <field name="name">Customer Packings</field>
             <field name="res_model">stock.packing.out</field>
@@ -650,7 +662,7 @@ this repository contains the full copyright notices and license terms. -->
             <field name="view" ref="packing_internal_view_form"/>
             <field name="act_window" ref="act_packing_internal_assigned_form"/>
         </record>
-        <menuitem parent="menu_packing_internal_form" sequence="20"
+        <menuitem parent="menu_packing_internal_form" sequence="40"
                   action="act_packing_internal_assigned_form"
                   id="menu_packing_internal_assigned_form"/>
 
@@ -693,14 +705,12 @@ this repository contains the full copyright notices and license terms. -->
                         <field name="customer"/>
                         <label name="delivery_address"/>
                         <field name="delivery_address"/>
-                        <label name="warehouse"/>
-                        <field name="warehouse"/>
-                        <label name="customer_location"/>
-                        <field name="customer_location"/>
                         <label name="planned_date"/>
                         <field name="planned_date"/>
                         <label name="effective_date"/>
                         <field name="effective_date"/>
+                        <label name="warehouse"/>
+                        <field name="warehouse"/>
                         <notebook colspan="6">
                             <page string="Incoming Moves" id="incoming_moves">
                                 <field name="incoming_moves" colspan="4">
@@ -760,6 +770,7 @@ this repository contains the full copyright notices and license terms. -->
                 ]]>
             </field>
         </record>
+
         <record model="ir.action.act_window" id="act_packing_out_return_form">
             <field name="name">Customer Return Packings</field>
             <field name="res_model">stock.packing.out.return</field>
