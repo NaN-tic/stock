@@ -1,23 +1,57 @@
-Version 1.2.7 - 2011-05-29
+* Allow to define the effective date of shipments
+* Prevent changing product type if stock moves exist
+* Use new methods to compute quantities in StockMixin._search_quantity()
+* Split products_by_location into two methods on Move:
+  compute_quantities_query and compute_quantities
+* Use origin for inventory moves
+* Allow partial assignation on Supplier Shipment Return
+
+Version 3.0.0 - 2013-10-21
+* Bug fixes (see mercurial logs for details)
+* Add Mixin class with helper to setup stock quantity fields
+* Allow to customize move creation of Inventory
+* Allow to customize unique constraint on Inventory
+* Allow specific grouping Period Cache
+* Add grouping on products_by_location and assign_try
+
+Version 2.8.0 - 2013-04-22
+* Bug fixes (see mercurial logs for details)
+* Merge all shipment Many2One into shipment Reference
+* Add origin Reference on Stock Move
+* Add workflow to stock move
+
+Version 2.6.0 - 2012-10-22
+* Bug fixes (see mercurial logs for details)
+* Add Product Quantities By Warehouse
+
+Version 2.4.0 - 2012-04-24
+* Bug fixes (see mercurial logs for details)
+* Remove special to_location_warehouse search clause
+* Remove default from and to location and instead use domain
+* Update cost_price only from supplier to storage
+
+Version 2.2.0 - 2011-10-25
+* Bug fixes (see mercurial logs for details)
+* Ensure coherence between planned date of shipments and moves
+
+Version 2.0.0 - 2011-04-27
+* Bug fixes (see mercurial logs for details)
+* Add period to reduce data computation
+* Add internal_quantity on move to speedup computation
+
+Version 1.8.0 - 2010-11-01
 * Bug fixes (see mercurial logs for details)
 
-Version 1.2.6 - 2010-11-02
+Version 1.6.0 - 2010-05-11
 * Bug fixes (see mercurial logs for details)
+* Use model singleton to define shipment sequences
+* Add default search value on inventory, move and shipments
 
-Version 1.2.5 - 2010-09-01
-* Some bug fixes (see mercurial logs for details)
-
-Version 1.2.4 - 2010-08-31
-* Security fix to use safe_eval instead of eval
-
-Version 1.2.3 - 2010-02-18
-* Some bug fixes (see mercurial logs for details)
-
-Version 1.2.2 - 2009-11-24
-* Some bug fixes (see mercurial logs for details)
-
-Version 1.2.1 - 2009-07-07
-* Some bug fixes (see mercurial logs for details)
+Version 1.4.0 - 2009-10-19
+* Bug fixes (see mercurial logs for details)
+* Add new group "Stock Force Assignment"
+* Migrate packing* objects and tables to shipment*
+* Return move id in create_move of inventory line
 
 Version 1.2.0 - 2009-04-20
 * Bug fixes (see mercurial logs for details)

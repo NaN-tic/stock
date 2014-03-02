@@ -1,453 +1,559 @@
 #This file is part of Tryton.  The COPYRIGHT file at the top level of
 #this repository contains the full copyright notices and license terms.
-"Move"
-from trytond.model import ModelView, ModelSQL, fields, OPERATORS
-from trytond.backend import TableHandler
-from decimal import Decimal
 import datetime
+import operator
+from decimal import Decimal
+from functools import partial
+from sql import Literal, Union, Column
+from sql.aggregate import Sum
+from sql.conditionals import Coalesce
+from sql.operators import Concat
+
+from trytond.model import Workflow, Model, ModelView, ModelSQL, fields
+from trytond import backend
+from trytond.pyson import In, Eval, Not, Equal, If, Bool
+from trytond.tools import reduce_ids
+from trytond.transaction import Transaction
+from trytond.pool import Pool
+
+__all__ = ['StockMixin', 'Move']
 
 STATES = {
-    'readonly': "(state in ('cancel', 'done'))",
+    'readonly': In(Eval('state'), ['cancel', 'assigned', 'done']),
 }
+DEPENDS = ['state']
 
 
-class Move(ModelSQL, ModelView):
+class StockMixin:
+    '''Mixin class with helper to setup stock quantity field.'''
+
+    @classmethod
+    def _quantity_context(cls, name):
+        pool = Pool()
+        Date = pool.get('ir.date')
+
+        context = Transaction().context
+        new_context = {}
+        if name == 'quantity':
+            if (context.get('stock_date_end')
+                    and context['stock_date_end'] > Date.today()):
+                new_context['stock_date_end'] = Date.today()
+        elif name == 'forecast_quantity':
+            new_context['forecast'] = True
+            if not context.get('stock_date_end'):
+                new_context['stock_date_end'] = datetime.date.max
+        return new_context
+
+    @classmethod
+    def _get_quantity(cls, records, name, location_ids, products=None,
+            grouping=('product',), position=-1):
+        """
+        Compute for each record the stock quantity in the default uom of the
+        product.
+
+        location_ids is the list of IDs of locations to take account to compute
+            the stock.
+        products restrict the stock computation to the this products (more
+            efficient), so it should be the products related to records.
+            If it is None all products are used.
+        grouping defines how stock moves are grouped.
+        position defines which field of grouping corresponds to the record
+            whose quantity is computed.
+
+        Return a dictionary with records id as key and quantity as value.
+        """
+        pool = Pool()
+        Product = pool.get('product.product')
+
+        record_ids = [r.id for r in records]
+        quantities = dict.fromkeys(record_ids, 0.0)
+        if not location_ids:
+            return quantities
+
+        product_ids = products and [p.id for p in products] or None
+
+        with Transaction().set_context(cls._quantity_context(name)):
+            pbl = Product.products_by_location(location_ids=location_ids,
+                product_ids=product_ids, with_childs=True,
+                grouping=grouping)
+
+        for key, quantity in pbl.iteritems():
+            # pbl could return None in some keys
+            if (key[position] is not None and
+                    key[position] in quantities):
+                quantities[key[position]] += quantity
+        return quantities
+
+    @classmethod
+    def _search_quantity(cls, name, location_ids, domain=None,
+            grouping=('product',), position=-1):
+        """
+        Compute the domain to filter records which validates the domain over
+        quantity field.
+
+        The context with keys:
+            stock_skip_warehouse: if set, quantities on a warehouse are no more
+                quantities of all child locations but quantities of the storage
+                zone.
+        location_ids is the list of IDs of locations to take account to compute
+            the stock.
+        grouping defines how stock moves are grouped.
+        position defines which field of grouping corresponds to the record
+            whose quantity is computed.
+        """
+        pool = Pool()
+        Location = pool.get('stock.location')
+        Move = pool.get('stock.move')
+
+        if not location_ids or not domain:
+            return []
+
+        # Skip warehouse location in favor of their storage location
+        # to compute quantities. Keep track of which ids to remove
+        # and to add after the query.
+        if Transaction().context.get('stock_skip_warehouse'):
+            location_ids = set(location_ids)
+            for location in Location.browse(list(location_ids)):
+                if location.type == 'warehouse':
+                    location_ids.remove(location.id)
+                    location_ids.add(location.storage_location.id)
+            location_ids = list(location_ids)
+
+        with Transaction().set_context(cls._quantity_context(name)):
+            query = Move.compute_quantities_query(location_ids,
+                with_childs=True, grouping=grouping,
+                grouping_filter=None)
+            having_domain = getattr(cls, name)._field.convert_domain(domain, {
+                    None: (query, {}),
+                    }, cls)
+            # The last column of 'query' is always the quantity for the 'key'.
+            # It is computed with a SUM() aggregator so in having we have to
+            # use the SUM() expression and not the name of column
+            having_domain.left = query.columns[-1].expression
+            if query.having:
+                query.having &= having_domain
+            else:
+                query.having = having_domain
+            quantities = Move.compute_quantities(query, location_ids,
+                with_childs=True, grouping=grouping,
+                grouping_filter=None)
+
+        record_ids = []
+        for key, quantity in quantities.iteritems():
+            # pbl could return None in some keys
+            if key[position] is not None:
+                record_ids.append(key[position])
+
+        return [('id', 'in', record_ids)]
+
+
+class Move(Workflow, ModelSQL, ModelView):
     "Stock Move"
-    _name = 'stock.move'
-    _description = __doc__
+    __name__ = 'stock.move'
+    _order_name = 'product'
     product = fields.Many2One("product.product", "Product", required=True,
-            select=1, states=STATES,
-            on_change=['product', 'currency', 'uom', 'company',
-                'from_location', 'to_location'],
-            domain=[('type', '!=', 'service')])
+        select=True, states=STATES,
+        domain=[('type', '!=', 'service')],
+        depends=DEPENDS)
+    product_uom_category = fields.Function(
+        fields.Many2One('product.uom.category', 'Product Uom Category'),
+        'on_change_with_product_uom_category')
     uom = fields.Many2One("product.uom", "Uom", required=True, states=STATES,
-            domain="[('category', '=', " \
-                    "(product, 'product.default_uom.category'))]",
-            context="{'category': (product, 'product.default_uom.category')}",
-            on_change=['product', 'currency', 'uom', 'company',
-                'from_location', 'to_location'])
-    unit_digits = fields.Function('get_unit_digits', type='integer',
-            string='Unit Digits', on_change_with=['uom'])
+        domain=[
+            ('category', '=', Eval('product_uom_category')),
+            ],
+        depends=['state', 'product_uom_category'])
+    unit_digits = fields.Function(fields.Integer('Unit Digits'),
+        'on_change_with_unit_digits')
     quantity = fields.Float("Quantity", required=True,
-            digits="(16, unit_digits)", states=STATES)
-    from_location = fields.Many2One("stock.location", "From Location", select=1,
-            required=True, states=STATES,
-            domain="[('type', 'not in', " \
-                    "('warehouse', 'view'))]")
-    to_location = fields.Many2One("stock.location", "To Location", select=1,
-            required=True, states=STATES,
-            domain="[('type', 'not in', " \
-                    "('warehouse', 'view'))]")
-    packing_in = fields.Many2One('stock.packing.in', 'Supplier Shipment',
-            readonly=True, select=1, ondelete='CASCADE')
-    packing_out = fields.Many2One('stock.packing.out', 'Customer Shipment',
-            readonly=True, select=1, ondelete='CASCADE')
-    packing_out_return = fields.Many2One('stock.packing.out.return',
-            'Customer Return Shipment', readonly=True, select=1,
-            ondelete='CASCADE')
-    packing_in_return = fields.Many2One('stock.packing.in.return',
-            'Supplier Return Shipment', readonly=True, select=1,
-            ondelete='CASCADE')
-    packing_internal = fields.Many2One('stock.packing.internal',
-            'Internal Shipment', readonly=True, select=1, ondelete='CASCADE')
-    planned_date = fields.Date("Planned Date", states=STATES, select=2)
-    effective_date = fields.Date("Effective Date", readonly=True, select=2)
+        digits=(16, Eval('unit_digits', 2)), states=STATES,
+        depends=['state', 'unit_digits'])
+    internal_quantity = fields.Float('Internal Quantity', readonly=True,
+        required=True)
+    from_location = fields.Many2One("stock.location", "From Location",
+        select=True, required=True, states=STATES, depends=DEPENDS,
+        domain=[('type', 'not in', ('warehouse', 'view'))])
+    to_location = fields.Many2One("stock.location", "To Location", select=True,
+        required=True, states=STATES, depends=DEPENDS,
+        domain=[('type', 'not in', ('warehouse', 'view'))])
+    shipment = fields.Reference('Shipment', selection='get_shipment',
+        readonly=True, select=True)
+    origin = fields.Reference('Origin', selection='get_origin', select=True,
+        states={
+            'readonly': Eval('state') != 'draft',
+            },
+        depends=['state'])
+    planned_date = fields.Date("Planned Date", states={
+            'readonly': (In(Eval('state'), ['cancel', 'assigned', 'done'])
+                | Eval('shipment'))
+            }, depends=['state', 'shipment'],
+        select=True)
+    effective_date = fields.Date("Effective Date", readonly=True, select=True,
+        states={
+            'required': Eval('state') == 'done',
+            },
+        depends=['state'])
     state = fields.Selection([
         ('draft', 'Draft'),
         ('assigned', 'Assigned'),
         ('done', 'Done'),
         ('cancel', 'Canceled'),
-        ], 'State', select=1, readonly=True)
+        ], 'State', select=True, readonly=True)
     company = fields.Many2One('company.company', 'Company', required=True,
-            states={
-                'readonly': "state != 'draft'",
-            }, domain="[('id', 'company' in context and '=' or '!=', " \
-                    "context.get('company', 0))]")
+        states={
+            'readonly': Not(Equal(Eval('state'), 'draft')),
+            },
+        domain=[
+            ('id', If(In('company', Eval('context', {})), '=', '!='),
+                Eval('context', {}).get('company', -1)),
+            ],
+        depends=['state'])
     unit_price = fields.Numeric('Unit Price', digits=(16, 4),
-            states={
-                'invisible': "not unit_price_required",
-                'required': "unit_price_required",
-                'readonly': "state != 'draft'",
-            })
+        states={
+            'invisible': Not(Bool(Eval('unit_price_required'))),
+            'required': Bool(Eval('unit_price_required')),
+            'readonly': Not(Equal(Eval('state'), 'draft')),
+            },
+        depends=['unit_price_required', 'state'])
     cost_price = fields.Numeric('Cost Price', digits=(16, 4), readonly=True)
     currency = fields.Many2One('currency.currency', 'Currency',
-            states={
-                'invisible': "not unit_price_required",
-                'required': "unit_price_required",
-                'readonly': "state != 'draft'",
-            })
-    unit_price_required = fields.Function('get_unit_price_required',
-            type='boolean', string='Unit Price Required',
-            on_change_with=['from_location', 'to_location'])
+        states={
+            'invisible': Not(Bool(Eval('unit_price_required'))),
+            'required': Bool(Eval('unit_price_required')),
+            'readonly': Not(Equal(Eval('state'), 'draft')),
+            },
+        depends=['unit_price_required', 'state'])
+    unit_price_required = fields.Function(fields.Boolean('Unit Price Required'),
+        'on_change_with_unit_price_required')
 
-    def __init__(self):
-        super(Move, self).__init__()
-        self._sql_constraints += [
+    @classmethod
+    def __setup__(cls):
+        super(Move, cls).__setup__()
+        cls._deny_modify_assigned = set(['product', 'uom', 'quantity',
+            'from_location', 'to_location', 'company', 'unit_price',
+            'currency'])
+        cls._deny_modify_done_cancel = (cls._deny_modify_assigned |
+            set(['planned_date', 'effective_date', 'state']))
+        cls._allow_modify_closed_period = set()
+
+        cls._sql_constraints += [
             ('check_move_qty_pos',
                 'CHECK(quantity >= 0.0)', 'Move quantity must be positive'),
+            ('check_move_internal_qty_pos',
+                'CHECK(internal_quantity >= 0.0)',
+                'Internal move quantity must be positive'),
             ('check_from_to_locations',
                 'CHECK(from_location != to_location)',
                 'Source and destination location must be different'),
-            ('check_packing',
-                'CHECK((COALESCE(packing_in, 0) / COALESCE(packing_in, 1) ' \
-                        '+ COALESCE(packing_out, 0) / ' \
-                            'COALESCE(packing_out, 1) ' \
-                        '+ COALESCE(packing_internal, 0) / ' \
-                            'COALESCE(packing_internal, 1) ' \
-                        '+ COALESCE(packing_in_return, 0) / ' \
-                            'COALESCE(packing_in_return, 1) ' \
-                        '+ COALESCE(packing_out_return, 0) / ' \
-                            'COALESCE(packing_out_return, 1)) ' \
-                        '<= 1)',
-                'Move can be on only one Shipment'),
-        ]
-        self._constraints += [
-            ('check_product_type', 'service_product'),
-        ]
-        self._order[0] = ('id', 'DESC')
-        self._error_messages.update({
-            'set_state_draft': 'You can not set state to draft!',
-            'set_state_assigned': 'You can not set state to assigned!',
-            'set_state_done': 'You can not set state to done!',
-            'del_draft_cancel': 'You can only delete draft or cancelled moves!',
-            'service_product': 'You can not use service products for a move!',
+            ]
+        cls._order[0] = ('id', 'DESC')
+        cls._error_messages.update({
+            'set_state_draft': ('You can not set stock move "%s" to draft '
+                'state.'),
+            'set_state_assigned': ('You can not set stock move "%s" to '
+                'assigned state.'),
+            'set_state_done': 'You can not set stock move "%s" to done state.',
+            'del_draft_cancel': ('You can not delete stock move "%s" because '
+                'it is not in draft or cancelled state.'),
+            'period_closed': ('You can not modify move "%(move)s" because '
+                'period "%(period)s" is closed.'),
+            'modify_assigned': ('You can not modify stock move "%s" because '
+                'it is in "Assigned" state.'),
+            'modify_done_cancel': ('You can not modify stock move "%s" '
+                'because it is in "Done" or "Cancel" state.'),
             })
+        cls._transitions |= set((
+                ('draft', 'assigned'),
+                ('draft', 'done'),
+                ('draft', 'cancel'),
+                ('assigned', 'draft'),
+                ('assigned', 'done'),
+                ('assigned', 'cancel'),
+                ))
+        cls._buttons.update({
+                'cancel': {
+                    'invisible': ~Eval('state').in_(['draft', 'assigned']),
+                    },
+                'draft': {
+                    'invisible': ~Eval('state').in_(['assigned']),
+                    },
+                'assign': {
+                    'invisible': ~Eval('state').in_(['assigned']),
+                    },
+                'do': {
+                    'invisible': ~Eval('state').in_(['draft', 'assigned']),
+                    },
+                })
 
-    def init(self, cursor, module_name):
-        super(Move, self).init(cursor, module_name)
+    @classmethod
+    def __register__(cls, module_name):
+        TableHandler = backend.get('TableHandler')
+        cursor = Transaction().cursor
+        sql_table = cls.__table__()
 
-        table  = TableHandler(cursor, self, module_name)
+        # Migration from 1.2: packing renamed into shipment
+        table = TableHandler(cursor, cls, module_name)
+        table.drop_constraint('check_packing')
+        for suffix in ('in', 'out', 'in_return', 'out_return', 'internal'):
+            old_column = 'packing_%s' % suffix
+            new_column = 'shipment_%s' % suffix
+            if table.column_exist(old_column):
+                table.index_action(old_column, action='remove')
+            table.drop_fk(old_column)
+            table.column_rename(old_column, new_column)
+
+        # Migration from 1.8: new field internal_quantity
+        internal_quantity_exist = table.column_exist('internal_quantity')
+
+        super(Move, cls).__register__(module_name)
+
+        # Migration from 1.8: fill new field internal_quantity
+        if not internal_quantity_exist:
+            offset = 0
+            limit = cursor.IN_MAX
+            moves = True
+            while moves:
+                moves = cls.search([], offset=offset, limit=limit)
+                offset += limit
+                for move in moves:
+                    internal_quantity = cls._get_internal_quantity(
+                            move.quantity, move.uom, move.product)
+                    cursor.execute(*sql_table.update(
+                            columns=[sql_table.internal_quantity],
+                            values=[internal_quantity],
+                            where=sql_table.id == move.id))
+            table = TableHandler(cursor, cls, module_name)
+            table.not_null_action('internal_quantity', action='add')
 
         # Migration from 1.0 check_packing_in_out has been removed
+        table = TableHandler(cursor, cls, module_name)
         table.drop_constraint('check_packing_in_out')
 
-    def default_planned_date(self, cursor, user, context=None):
-        if context and context.get('planned_date'):
-            return context.get('planned_date')
+        # Migration from 2.6: merge all shipments
+        table.drop_constraint('check_shipment')
+        shipments = {
+            'shipment_in': 'stock.shipment.in',
+            'shipment_out': 'stock.shipment.out',
+            'shipment_out_return': 'stock.shipment.out.return',
+            'shipment_in_return': 'stock.shipment.in.return',
+            'shipment_internal': 'stock.shipment.internal',
+            }
+        for column, model in shipments.iteritems():
+            if table.column_exist(column):
+                cursor.execute(*sql_table.update(
+                        columns=[sql_table.shipment],
+                        values=[Concat(model + ',',
+                                Column(sql_table, column))],
+                        where=Column(sql_table, column) != None))
+                table.drop_column(column)
 
-    def default_to_location(self, cursor, user, context=None):
-        location_obj = self.pool.get('stock.location')
-        party_obj = self.pool.get('party.party')
-        res = False
+        # Add index on create_date
+        table.index_action('create_date', action='add')
 
-        if context is None:
-            context = {}
+    @staticmethod
+    def default_planned_date():
+        return Transaction().context.get('planned_date')
 
-        warehouse = None
-        if context.get('warehouse'):
-            warehouse = location_obj.browse(cursor, user, context['warehouse'],
-                    context=context)
-
-        if context.get('type', '') == 'inventory_in':
-            if warehouse:
-                res = warehouse.storage_location.id
-        elif context.get('type', '') == 'inventory_out':
-            if warehouse:
-                res = warehouse.output_location.id
-        elif context.get('type', '') == 'incoming':
-            if warehouse:
-                res = warehouse.input_location.id
-        elif context.get('type', '') == 'outgoing':
-            if context.get('customer'):
-                customer = party_obj.browse(cursor, user, context['customer'],
-                        context=context)
-                res = customer.customer_location.id
-
-        if context.get('to_location'):
-            res = context.get('to_location')
-        return res
-
-    def default_from_location(self, cursor, user, context=None):
-        location_obj = self.pool.get('stock.location')
-        party_obj = self.pool.get('party.party')
-        res = False
-
-        if context is None:
-            context = {}
-
-        warehouse = None
-        if context.get('warehouse'):
-            warehouse = location_obj.browse(cursor, user, context['warehouse'],
-                    context=context)
-
-        if context.get('type', '') == 'inventory_in':
-            if warehouse:
-                res = warehouse.input_location.id
-        elif context.get('type', '') == 'inventory_out':
-            if warehouse:
-                res = warehouse.storage_location.id
-        elif context.get('type', '') == 'outgoing':
-            if warehouse:
-                res = warehouse.output_location.id
-        elif context.get('type', '') == 'incoming':
-            if context.get('supplier'):
-                supplier = party_obj.browse(cursor, user, context['supplier'],
-                        context=context)
-                res = supplier.supplier_location.id
-            elif context.get('customer'):
-                customer = party_obj.browse(cursor, user, context['customer'],
-                        context=context)
-                res = customer.customer_location.id
-
-        if context.get('from_location'):
-            res = context.get('from_location')
-        return res
-
-    def default_state(self, cursor, user, context=None):
+    @staticmethod
+    def default_state():
         return 'draft'
 
-    def default_company(self, cursor, user, context=None):
-        company_obj = self.pool.get('company.company')
-        if context is None:
-            context = {}
-        if context.get('company'):
-            return context['company']
-        return False
+    @staticmethod
+    def default_company():
+        return Transaction().context.get('company')
 
-    def default_currency(self, cursor, user, context=None):
-        company_obj = self.pool.get('company.company')
-        currency_obj = self.pool.get('currency.currency')
-        if context is None:
-            context = {}
-        company = None
-        if context.get('company'):
-            company = company_obj.browse(cursor, user, context['company'],
-                    context=context)
+    @staticmethod
+    def default_currency():
+        Company = Pool().get('company.company')
+        company = Transaction().context.get('company')
+        if company:
+            company = Company(company)
             return company.currency.id
-        return False
 
-    def on_change_with_unit_digits(self, cursor, user, ids, vals,
-            context=None):
-        uom_obj = self.pool.get('product.uom')
-        if vals.get('uom'):
-            uom = uom_obj.browse(cursor, user, vals['uom'],
-                    context=context)
-            return uom.digits
+    @staticmethod
+    def default_unit_digits():
         return 2
 
-    def get_unit_digits(self, cursor, user, ids, name, arg, context=None):
-        res = {}
-        for move in self.browse(cursor, user, ids, context=context):
-            res[move.id] = move.uom.digits
-        return res
+    @fields.depends('uom')
+    def on_change_with_unit_digits(self, name=None):
+        if self.uom:
+            return self.uom.digits
+        return 2
 
-    def on_change_product(self, cursor, user, ids, vals, context=None):
-        product_obj = self.pool.get('product.product')
-        uom_obj = self.pool.get('product.uom')
-        currency_obj = self.pool.get('currency.currency')
-        company_obj = self.pool.get('company.company')
-        location_obj = self.pool.get('stock.location')
-
-        if context is None:
-            context = {}
+    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
+        'to_location')
+    def on_change_product(self):
+        pool = Pool()
+        Uom = pool.get('product.uom')
+        Currency = pool.get('currency.currency')
 
         res = {
             'unit_price': Decimal('0.0'),
-        }
-        if vals.get('product'):
-            product = product_obj.browse(cursor, user, vals['product'],
-                    context=context)
-            res['uom'] = product.default_uom.id
-            res['uom.rec_name'] = product.default_uom.rec_name
-            res['unit_digits'] = product.default_uom.digits
-            to_location = None
-            if vals.get('to_location'):
-                to_location = location_obj.browse(cursor, user,
-                        vals['to_location'], context=context)
-            if to_location and to_location.type == 'storage':
-                unit_price = product.cost_price
-                if vals.get('uom') and vals['uom'] != product.default_uom.id:
-                    uom = uom_obj.browse(cursor, user, vals['uom'],
-                            context=context)
-                    unit_price = uom_obj.compute_price(cursor, user,
-                            product.default_uom, unit_price, uom,
-                            context=context)
-                if vals.get('currency') and vals.get('company'):
-                    currency = currency_obj.browse(cursor, user,
-                            vals['currency'], context=context)
-                    company = company_obj.browse(cursor, user,
-                            vals['company'], context=context)
-                    unit_price = currency_obj.compute(cursor, user,
-                            company.currency, unit_price, currency,
-                            round=False, context=context)
-                res['unit_price'] = unit_price
-        return res
-
-    def on_change_uom(self, cursor, user, ids, vals, context=None):
-        product_obj = self.pool.get('product.product')
-        uom_obj = self.pool.get('product.uom')
-        currency_obj = self.pool.get('currency.currency')
-        company_obj = self.pool.get('company.company')
-        location_obj = self.pool.get('stock.location')
-
-        if context is None:
-            context = {}
-
-        res = {
-            'unit_price': Decimal('0.0'),
-        }
-        if vals.get('product'):
-            product = product_obj.browse(cursor, user, vals['product'],
-                    context=context)
-            to_location = None
-            if vals.get('to_location'):
-                to_location = location_obj.browse(cursor, user,
-                        vals['to_location'], context=context)
-            if to_location and to_location.type == 'storage':
-                unit_price = product.cost_price
-                if vals.get('uom') and vals['uom'] != product.default_uom.id:
-                    uom = uom_obj.browse(cursor, user, vals['uom'],
-                            context=context)
-                    unit_price = uom_obj.compute_price(cursor, user,
-                            product.default_uom, unit_price, uom,
-                            context=context)
-                if vals.get('currency') and vals.get('company'):
-                    currency = currency_obj.browse(cursor, user,
-                            vals['currency'], context=context)
-                    company = company_obj.browse(cursor, user,
-                            vals['company'], context=context)
-                    unit_price = currency_obj.compute(cursor, user,
-                            company.currency, unit_price, currency,
-                            round=False, context=context)
-                res['unit_price'] = unit_price
-        return res
-
-    def default_unit_price_required(self, cursor, user, context=None):
-        from_location = self.default_from_location(cursor, user,
-                context=context)
-        to_location = self.default_to_location(cursor,user,
-                context=context)
-        vals = {
-            'from_location': from_location,
-            'to_location': to_location,
             }
-        return self.on_change_with_unit_price_required(cursor, user, [],
-                vals, context=context)
+        if self.product:
+            res['uom'] = self.product.default_uom.id
+            res['uom.rec_name'] = self.product.default_uom.rec_name
+            res['unit_digits'] = self.product.default_uom.digits
+            unit_price = None
+            if self.from_location and self.from_location.type in ('supplier',
+                    'production'):
+                unit_price = self.product.cost_price
+            elif self.to_location and self.to_location.type == 'customer':
+                unit_price = self.product.list_price
+            if unit_price:
+                if self.uom != self.product.default_uom:
+                    unit_price = Uom.compute_price(self.product.default_uom,
+                        unit_price, self.uom)
+                if self.currency and self.company:
+                    unit_price = Currency.compute(self.company.currency,
+                        unit_price, self.currency, round=False)
+                res['unit_price'] = unit_price
+        return res
 
-    def on_change_with_unit_price_required(self, cursor, user, ids, vals,
-            context=None):
-        location_obj = self.pool.get('stock.location')
-        if vals.get('from_location'):
-            from_location = location_obj.browse(cursor, user,
-                    vals['from_location'], context=context)
-            if from_location.type == 'supplier':
-                return True
-        if vals.get('to_location'):
-            to_location = location_obj.browse(cursor, user,
-                    vals['to_location'], context=context)
-            if to_location.type == 'customer':
-                return True
+    @fields.depends('product')
+    def on_change_with_product_uom_category(self, name=None):
+        if self.product:
+            return self.product.default_uom_category.id
+
+    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
+        'to_location')
+    def on_change_uom(self):
+        pool = Pool()
+        Uom = pool.get('product.uom')
+        Currency = pool.get('currency.currency')
+
+        res = {
+            'unit_price': Decimal('0.0'),
+            }
+        if self.product:
+            if self.to_location and self.to_location.type == 'storage':
+                unit_price = self.product.cost_price
+                if self.uom and self.uom != self.product.default_uom:
+                    unit_price = Uom.compute_price(self.product.default_uom,
+                        unit_price, self.uom)
+                if self.currency and self.company:
+                    unit_price = Currency.compute(self.company.currency,
+                        unit_price, self.currency, round=False)
+                res['unit_price'] = unit_price
+        return res
+
+    @fields.depends('from_location', 'to_location')
+    def on_change_with_unit_price_required(self, name=None):
+        if (self.from_location
+                and self.from_location.type in ('supplier', 'production')):
+            return True
+        if (self.to_location
+                and self.to_location.type == 'customer'):
+            return True
+        if (self.from_location and self.to_location
+                and self.from_location.type == 'storage'
+                and self.to_location.type == 'supplier'):
+            return True
         return False
 
-    def get_unit_price_required(self, cursor, user, ids, name, arg,
-            context=None):
-        res = {}
-        for move in self.browse(cursor, user, ids, context=context):
-            res[move.id] = False
-            if move.from_location.type == 'supplier':
-                res[move.id] = True
-            if move.to_location.type == 'customer':
-                res[move.id] = True
-        return res
+    @staticmethod
+    def _get_shipment():
+        'Return list of Model names for shipment Reference'
+        return [
+            'stock.shipment.in',
+            'stock.shipment.out',
+            'stock.shipment.out.return',
+            'stock.shipment.in.return',
+            'stock.shipment.internal',
+            ]
 
-    def check_product_type(self, cursor, user, ids):
-        for move in self.browse(cursor, user, ids):
-            if move.product.type == 'service':
-                return False
-        return True
+    @classmethod
+    def get_shipment(cls):
+        IrModel = Pool().get('ir.model')
+        models = cls._get_shipment()
+        models = IrModel.search([
+                ('model', 'in', models),
+                ])
+        return [(None, '')] + [(m.model, m.name) for m in models]
 
-    def get_rec_name(self, cursor, user, ids, name, arg, context=None):
-        if not ids:
-            return {}
-        res = {}
-        moves = self.browse(cursor, user, ids, context=context)
-        for m in moves:
-            res[m.id] = "%s%s %s" % (m.quantity, m.uom.symbol, m.product.rec_name)
-        return res
+    @staticmethod
+    def _get_origin():
+        'Return list of Model names for origin Reference'
+        return ['stock.inventory.line']
 
-    def search_rec_name(self, cursor, user, name, args, context=None):
-        args2 = []
-        i = 0
-        while i < len(args):
-            args2.append(('product', args[i][1], args[i][2]))
-            i += 1
-        return args2
+    @classmethod
+    def get_origin(cls):
+        IrModel = Pool().get('ir.model')
+        models = cls._get_origin()
+        models = IrModel.search([
+                ('model', 'in', models),
+                ])
+        return [(None, '')] + [(m.model, m.name) for m in models]
 
-    def search(self, cursor, user, args, offset=0, limit=None, order=None,
-            context=None, count=False, query_string=False):
-        location_obj = self.pool.get('stock.location')
+    @property
+    def origin_name(self):
+        return self.origin.rec_name if self.origin else None
 
-        args = args[:]
-        def process_args(args):
-            i = 0
-            while i < len(args):
-                #add test for xmlrpc that doesn't handle tuple
-                if (isinstance(args[i], tuple) or \
-                        (isinstance(args[i], list) and len(args[i]) > 2 and \
-                        args[i][1] in OPERATORS)) and \
-                        args[i][0] == 'to_location_warehouse':
-                    location_id = False
-                    if args[i][2]:
-                        location = location_obj.browse(cursor, user,
-                                args[i][2], context=context)
-                        if location.type == 'warehouse':
-                            location_id = location.input_location.id
-                    args[i] = ('to_location', args[i][1], location_id)
-                elif isinstance(args[i], list):
-                    process_args(args[i])
-                i += 1
-        process_args(args)
-        return super(Move, self).search(cursor, user, args, offset=offset,
-                limit=limit, order=order, context=context, count=count,
-                query_string=query_string)
+    @classmethod
+    def check_period_closed(cls, moves):
+        Period = Pool().get('stock.period')
+        periods = Period.search([
+                ('state', '=', 'closed'),
+                ], order=[('date', 'DESC')], limit=1)
+        if periods:
+            period, = periods
+            for move in moves:
+                date = (move.effective_date if move.effective_date
+                    else move.planned_date)
+                if date and date < period.date:
+                    cls.raise_user_error('period_closed', {
+                            'move': move.rec_name,
+                            'period': period.rec_name,
+                            })
 
-    def _update_product_cost_price(self, cursor, user, product_id, quantity, uom,
-                                   unit_price, currency, company, context=None):
+    def get_rec_name(self, name):
+        return ("%s%s %s"
+            % (self.quantity, self.uom.symbol, self.product.rec_name))
+
+    @classmethod
+    def search_rec_name(cls, name, clause):
+        return [('product',) + tuple(clause[1:])]
+
+    def _update_product_cost_price(self, direction):
         """
-        Update the cost price on the given product
-
-        :param cursor: the database cursor
-        :param user: the user id
-        :param product_id: the id of the product
-        :param quantity: the quantity of the product, positive if incoming and
-                negative if outgoing
-        :param uom: the uom id or a BrowseRecord of the uom
-        :param unit_price: the unit price of the product
-        :param currency: the currency of the unit price
-        :param company: the company id ot a BrowseRecord of the company
-        :param context: the context
+        Update the cost price on the given product.
+        The direction must be "in" if incoming and "out" if outgoing.
         """
-        uom_obj = self.pool.get('product.uom')
-        product_obj = self.pool.get('product.product')
-        location_obj = self.pool.get('stock.location')
-        currency_obj = self.pool.get('currency.currency')
-        company_obj = self.pool.get('company.company')
+        pool = Pool()
+        Uom = pool.get('product.uom')
+        Product = pool.get('product.product')
+        ProductTemplate = pool.get('product.template')
+        Location = pool.get('stock.location')
+        Currency = pool.get('currency.currency')
+        Date = pool.get('ir.date')
 
-        if context is None:
-            context = {}
-
-        if isinstance(uom, (int, long)):
-            uom = uom_obj.browse(cursor, user, uom, context=context)
-        if isinstance(company, (int, long)):
-            company = company_obj.browse(cursor, user, company, context=context)
-
-        ctx = context and context.copy() or {}
-        ctx['locations'] = location_obj.search(
-            cursor, user, [('type', '=', 'storage')], context=context)
-        ctx['stock_date_end'] = datetime.date.today()
-        product = product_obj.browse(cursor, user, product_id, context=ctx)
-        qty = uom_obj.compute_qty(
-            cursor, user, uom, quantity, product.default_uom, context=context)
+        if direction == 'in':
+            quantity = self.quantity
+        elif direction == 'out':
+            quantity = -self.quantity
+        context = {}
+        locations = Location.search([
+                ('type', '=', 'storage'),
+                ])
+        context['locations'] = [l.id for l in locations]
+        context['stock_date_end'] = Date.today()
+        with Transaction().set_context(context):
+            product = Product(self.product.id)
+        qty = Uom.compute_qty(self.uom, quantity, product.default_uom)
 
         qty = Decimal(str(qty))
-        product_qty = Decimal(str(product.template.quantity))
+        if hasattr(Product, 'cost_price'):
+            product_qty = product.quantity
+        else:
+            product_qty = product.template.quantity
+        product_qty = Decimal(str(product_qty))
         # convert wrt currency
-        unit_price = currency_obj.compute(
-            cursor, user, currency, unit_price, company.currency,
-            round=False, context=context)
+        with Transaction().set_context(date=self.effective_date):
+            unit_price = Currency.compute(self.currency, self.unit_price,
+                self.company.currency, round=False)
         # convert wrt to the uom
-        unit_price = uom_obj.compute_price(
-            cursor, user, uom, unit_price, product.default_uom, context=context)
+        unit_price = Uom.compute_price(self.uom, unit_price,
+            product.default_uom)
         if product_qty + qty != Decimal('0.0'):
             new_cost_price = (
                 (product.cost_price * product_qty) + (unit_price * qty)
@@ -455,141 +561,159 @@ class Move(ModelSQL, ModelView):
         else:
             new_cost_price = product.cost_price
 
-        ctx = context.copy()
-        ctx['user'] = user
-        product_obj.write(
-            cursor, 0, product.id, {'cost_price': new_cost_price},
-            context=ctx)
+        if hasattr(Product, 'cost_price'):
+            digits = Product.cost_price.digits
+            write = partial(Product.write, [product])
+        else:
+            digits = ProductTemplate.cost_price.digits
+            write = partial(ProductTemplate.write, [product.template])
+        new_cost_price = new_cost_price.quantize(
+            Decimal(str(10.0 ** -digits[1])))
 
-    def create(self, cursor, user, vals, context=None):
-        location_obj = self.pool.get('stock.location')
-        product_obj = self.pool.get('product.product')
+        with Transaction().set_user(0, set_context=True):
+            write({
+                    'cost_price': new_cost_price,
+                    })
 
-        vals = vals.copy()
+    @staticmethod
+    def _get_internal_quantity(quantity, uom, product):
+        Uom = Pool().get('product.uom')
+        internal_quantity = Uom.compute_qty(uom, quantity,
+            product.default_uom, round=True)
+        return internal_quantity
 
-        if vals.get('state') == 'done':
-            if not vals.get('effective_date'):
-                vals['effective_date'] = datetime.date.today()
-            from_location = location_obj.browse(cursor, user,
-                    vals['from_location'], context=context)
-            to_location = location_obj.browse(cursor, user,
-                    vals['to_location'], context=context)
-            product = product_obj.browse(cursor, user, vals['product'],
-                    context=context)
-            if from_location.type == 'supplier' \
-                    and product.cost_price_method == 'average':
-                self._update_product_cost_price(
-                    cursor, user, vals['product'], vals['quantity'],
-                    vals['uom'], vals['unit_price'], vals['currency'],
-                    vals['company'], context=context)
-            if to_location.type == 'supplier' \
-                    and product.cost_price_method == 'average':
-                self._update_product_cost_price(
-                    cursor, user, vals['product'], -vals['quantity'],
-                    vals['uom'], vals['unit_price'], vals['currency'],
-                    vals['company'], context=context)
-            if not vals.get('cost_price'):
-                # Re-read product to get the updated cost_price
-                product = product_obj.browse(cursor, user, vals['product'],
-                                             context=context)
-                vals['cost_price'] = product.cost_price
+    def set_effective_date(self):
+        pool = Pool()
+        Date = pool.get('ir.date')
 
-        elif vals.get('state') == 'assigned':
-            if not vals.get('effective_date'):
-                vals['effective_date'] = datetime.date.today()
-        return super(Move, self).create(cursor, user, vals, context=context)
+        if not self.effective_date and self.shipment:
+            self.effective_date = self.shipment.effective_date
+        if not self.effective_date:
+            self.effective_date = Date.today()
 
-    def write(self, cursor, user, ids, vals, context=None):
-        if context is None:
-            context = {}
+    @classmethod
+    @ModelView.button
+    @Workflow.transition('draft')
+    def draft(cls, moves):
+        cls.write(moves, {
+                'effective_date': None,
+                })
 
-        if isinstance(ids, (int, long)):
-            ids = [ids]
+    @classmethod
+    @ModelView.button
+    @Workflow.transition('assigned')
+    def assign(cls, moves):
+        for move in moves:
+            move.set_effective_date()
+            move.save()
 
-        if 'state' in vals:
-            for move in self.browse(cursor, user, ids, context=context):
-                if vals['state'] == 'cancel':
-                    vals['effective_date'] = False
-                    if move.from_location.type == 'supplier' \
-                            and move.state != 'cancel' \
-                            and move.product.cost_price_method == 'average':
-                        self._update_product_cost_price(
-                            cursor, user, move.product.id, -move.quantity,
-                            move.uom, move.unit_price, move.currency,
-                            move.company, context=context)
-                    if move.to_location.type == 'supplier' \
-                            and move.state != 'cancel' \
-                            and move.product.cost_price_method == 'average':
-                        self._update_product_cost_price(
-                            cursor, user, move.product.id, move.quantity,
-                            move.uom, move.unit_price, move.currency,
-                            move.company, context=context)
+    @classmethod
+    @ModelView.button
+    @Workflow.transition('done')
+    def do(cls, moves):
+        for move in moves:
+            move.set_effective_date()
+            if (move.from_location.type in ('supplier', 'production')
+                    and move.to_location.type == 'storage'
+                    and move.product.cost_price_method == 'average'):
+                move._update_product_cost_price('in')
+            elif (move.to_location.type == 'supplier'
+                    and move.from_location.type == 'storage'
+                    and move.product.cost_price_method == 'average'):
+                move._update_product_cost_price('out')
+            if not move.cost_price:
+                move.cost_price = move.product.cost_price
+            move.save()
 
-                elif vals['state'] == 'draft':
-                    if move.state == 'done':
-                        self.raise_user_error(cursor, 'set_state_draft',
-                                context=context)
-                elif vals['state'] == 'assigned':
-                    if move.state in ('cancel', 'done'):
-                        self.raise_user_error(cursor, 'set_state_assigned',
-                                context=context)
-                    vals['effective_date'] = datetime.date.today()
-                elif vals['state'] == 'done':
-                    if move.state in ('cancel'):
-                        self.raise_user_error(cursor, 'set_state_done',
-                                context=context)
-                    vals['effective_date'] = datetime.date.today()
+    @classmethod
+    @ModelView.button
+    @Workflow.transition('cancel')
+    def cancel(cls, moves):
+        pool = Pool()
+        Date = pool.get('ir.date')
 
-                    if move.from_location.type == 'supplier' \
-                            and move.state != 'done' \
-                            and move.product.cost_price_method == 'average':
-                        self._update_product_cost_price(
-                            cursor, user, move.product.id, move.quantity,
-                            move.uom, move.unit_price, move.currency,
-                            move.company, context=context)
-                    if move.to_location.type == 'supplier' \
-                            and move.state != 'done' \
-                            and move.product.cost_price_method == 'average':
-                        self._update_product_cost_price(
-                            cursor, user, move.product.id, -move.quantity,
-                            move.uom, move.unit_price, move.currency,
-                            move.company, context=context)
-        res = super(Move, self).write(cursor, user, ids, vals, context=context)
+        today = Date.today()
+        for move in moves:
+            move.effective_date = today
+            if (move.from_location.type in ('supplier', 'production')
+                    and move.to_location.type == 'storage'
+                    and move.product.cost_price_method == 'average'):
+                move._update_product_cost_price('out')
+            elif (move.to_location.type == 'supplier'
+                    and move.from_location.type == 'storage'
+                    and move.product.cost_price_method == 'average'):
+                move._update_product_cost_price('in')
+            move.effective_date = None
+            move.save()
 
-        if vals.get('state', '') == 'done':
-            #Re-read the move because cost_price has been updated
-            for move in self.browse(cursor, user, ids, context=context):
-                if not move.cost_price:
-                    self.write(cursor, user, move.id, {
-                        'cost_price': move.product.cost_price,
-                        }, context=context)
-        return res
+    @classmethod
+    def create(cls, vlist):
+        pool = Pool()
+        Product = pool.get('product.product')
+        Uom = pool.get('product.uom')
 
-    def delete(self, cursor, user, ids, context=None):
-        for move in self.browse(cursor, user, ids, context=context):
-            if move.state not in  ('draft', 'cancel'):
-                self.raise_user_error(cursor, 'del_draft_cancel',
-                        context=context)
-        return super(Move, self).delete(cursor, user, ids, context=context)
+        vlist = [x.copy() for x in vlist]
+        for vals in vlist:
+            assert vals.get('state', 'draft') == 'draft'
 
-    def pick_product(self, cursor, user, move, location_quantities, context=None):
+            product = Product(vals['product'])
+            uom = Uom(vals['uom'])
+            internal_quantity = cls._get_internal_quantity(vals['quantity'],
+                uom, product)
+            vals['internal_quantity'] = internal_quantity
+        moves = super(Move, cls).create(vlist)
+        cls.check_period_closed(moves)
+        return moves
+
+    @classmethod
+    def write(cls, *args):
+        actions = iter(args)
+        for moves, values in zip(actions, actions):
+            vals_set = set(values)
+            if cls._deny_modify_assigned & vals_set:
+                for move in moves:
+                    if move.state == 'assigned':
+                        cls.raise_user_error('modify_assigned', move.rec_name)
+            if cls._deny_modify_done_cancel & vals_set:
+                for move in moves:
+                    if move.state in ('done', 'cancel'):
+                        cls.raise_user_error('modify_done_cancel',
+                            (move.rec_name,))
+
+        super(Move, cls).write(*args)
+
+        actions = iter(args)
+        for moves, values in zip(actions, actions):
+            if any(f not in cls._allow_modify_closed_period for f in values):
+                cls.check_period_closed(moves)
+            for move in moves:
+                internal_quantity = cls._get_internal_quantity(move.quantity,
+                        move.uom, move.product)
+                if (internal_quantity != move.internal_quantity
+                        and internal_quantity
+                        != values.get('internal_quantity')):
+                    cls.write([move], {
+                            'internal_quantity': internal_quantity,
+                            })
+
+    @classmethod
+    def delete(cls, moves):
+        for move in moves:
+            if move.state not in ('draft', 'cancel'):
+                cls.raise_user_error('del_draft_cancel', (move.rec_name,))
+        super(Move, cls).delete(moves)
+
+    def pick_product(self, location_quantities):
         """
         Pick the product across the location. Naive (fast) implementation.
-
-        :param cursor: the database cursor
-        :param user: the user id
-        :param move: a BrowseRecord of stock.move
-        :param location_quantities: a list of tuple (location, available_qty)
-            where location is a BrowseRecord of stock.location.
-        :param context: the context
-        :return: a list of tuple (location, quantity) for quantities
-            that can be picked
+        Return a list of tuple (location, quantity) for quantities that can be
+        picked.
         """
         to_pick = []
-        needed_qty = move.quantity
+        needed_qty = self.quantity
         for location, available_qty in location_quantities.iteritems():
             # Ignore available_qty when too small
-            if available_qty < move.uom.rounding:
+            if available_qty < self.uom.rounding:
                 continue
             if needed_qty <= available_qty:
                 to_pick.append((location, needed_qty))
@@ -598,43 +722,49 @@ class Move(ModelSQL, ModelView):
                 to_pick.append((location, available_qty))
                 needed_qty -= available_qty
         # Force assignation for consumables:
-        if move.product.type == "consumable":
-            to_pick.append((move.from_location, needed_qty))
+        if self.product.consumable:
+            to_pick.append((self.from_location, needed_qty))
             return to_pick
         return to_pick
 
-    def assign_try(self, cursor, user, moves, context=None):
+    @classmethod
+    def assign_try(cls, moves, with_childs=True, grouping=('product',)):
         '''
         Try to assign moves.
         It will split the moves to assign as much possible.
-
-        :param cursor: the database cursor
-        :param user: the user id
-        :param moves: a BrowseRecordList of stock.move to assign
-        :param context: the context
-        :return: True if succeed or False if not
+        Return True if succeed or False if not.
         '''
-        product_obj = self.pool.get('product.product')
-        uom_obj = self.pool.get('product.uom')
-        date_obj = self.pool.get('ir.date')
-        location_obj = self.pool.get('stock.location')
+        pool = Pool()
+        Product = pool.get('product.product')
+        Uom = pool.get('product.uom')
+        Date = pool.get('ir.date')
+        Location = pool.get('stock.location')
 
-        if context is None:
-            context = {}
+        Transaction().cursor.lock(cls._table)
 
-        cursor.execute('LOCK TABLE stock_move')
+        if with_childs:
+            locations = Location.search([
+                    ('parent', 'child_of',
+                        [x.from_location.id for x in moves]),
+                    ])
+        else:
+            locations = list(set((m.from_location for m in moves)))
+        with Transaction().set_context(
+                stock_date_end=Date.today(),
+                stock_assign=True):
+            pbl = Product.products_by_location(
+                location_ids=[l.id for l in locations],
+                product_ids=[m.product.id for m in moves],
+                grouping=grouping)
 
-        local_ctx = context and context.copy() or {}
-        local_ctx['stock_date_end'] = date_obj.today(cursor, user,
-                context=context)
-        local_ctx['stock_assign'] = True
-        location_ids = location_obj.search(cursor, user, [
-            ('parent', 'child_of', [x.from_location.id for x in moves]),
-            ], context=context)
-        pbl = product_obj.products_by_location(cursor, user,
-            location_ids=location_ids,
-            product_ids=[m.product.id for m in moves],
-            context=local_ctx)
+        def get_key(location):
+            key = (location.id,)
+            for field in grouping:
+                value = getattr(move, field)
+                if isinstance(value, Model):
+                    value = value.id
+                key += (value,)
+            return key
 
         success = True
         for move in moves:
@@ -642,19 +772,20 @@ class Move(ModelSQL, ModelView):
                 continue
             to_location = move.to_location
             location_qties = {}
-            child_ids = location_obj.search(cursor, user, [
-                ('parent', 'child_of', [move.from_location.id]),
-                ], context=context)
-            for location in location_obj.browse(cursor, user, child_ids,
-                    context=context):
-                if (location.id, move.product.id) in pbl:
-                    location_qties[location] = uom_obj.compute_qty(
-                        cursor, user, move.product.default_uom,
-                        pbl[(location.id, move.product.id)], move.uom,
-                        round=False, context=context)
+            if with_childs:
+                childs = Location.search([
+                        ('parent', 'child_of', [move.from_location.id]),
+                        ])
+            else:
+                childs = [move.from_location]
+            for location in childs:
+                key = get_key(location)
+                if key in pbl:
+                    location_qties[location] = Uom.compute_qty(
+                        move.product.default_uom, pbl[key], move.uom,
+                        round=False)
 
-            to_pick = self.pick_product(
-                cursor, user, move, location_qties, context=context)
+            to_pick = move.pick_product(location_qties)
 
             picked_qties = 0.0
             for _, qty in to_pick:
@@ -663,32 +794,391 @@ class Move(ModelSQL, ModelView):
             if picked_qties < move.quantity:
                 success = False
                 first = False
-                self.write(cursor, user, move.id, {
+                cls.write([move], {
                     'quantity': move.quantity - picked_qties,
-                    }, context=context)
+                    })
             else:
                 first = True
             for from_location, qty in to_pick:
                 values = {
                     'from_location': from_location.id,
                     'quantity': qty,
-                    'state': 'assigned',
                     }
                 if first:
-                    self.write(cursor, user, move.id, values, context=context)
+                    cls.write([move], values)
+                    cls.assign([move])
                     first = False
                 else:
-                    move_id = self.copy(cursor, user, move.id, default=values,
-                            context=context)
+                    cls.assign(cls.copy([move], default=values))
 
-                qty_default_uom = uom_obj.compute_qty(
-                    cursor, user, move.uom, qty, move.product.default_uom,
-                    round=False, context=context)
+                qty_default_uom = Uom.compute_qty(move.uom, qty,
+                        move.product.default_uom, round=False)
 
-                pbl[(from_location.id, move.product.id)] = \
-                    pbl.get((from_location.id, move.product.id), 0.0) - qty_default_uom
-                pbl[(to_location.id, move.product.id)]= \
-                    pbl.get((to_location.id, move.product.id), 0.0) + qty_default_uom
+                from_key, to_key = get_key(from_location), get_key(to_location)
+                pbl[from_key] = pbl.get(from_key, 0.0) - qty_default_uom
+                pbl[to_key] = pbl.get(to_key, 0.0) + qty_default_uom
         return success
 
-Move()
+    @classmethod
+    def compute_quantities_query(cls, location_ids, with_childs=False,
+            grouping=('product',), grouping_filter=None):
+        """
+        Prepare a query object to compute for each location and product the
+        stock quantity in the default uom of the product.
+
+        The context with keys:
+            stock_date_end: if set the date of the stock computation.
+            stock_date_start: if set return the delta of the stock between the
+                two dates, (ignored if stock_date_end is missing).
+            stock_assign: if set compute also the assigned moves as done.
+            forecast: if set compute the forecast quantity.
+            stock_destinations: A list of location ids. If set, restrict the
+                computation to moves from and to those locations.
+            stock_skip_warehouse: if set, quantities on a warehouse are no more
+                quantities of all child locations but quantities of the storage
+                zone.
+        If with_childs, it computes also for child locations.
+        grouping is a tuple of Move field names and defines how stock moves are
+            grouped.
+        grouping_filter is a tuple of values, for the Move's field at the same
+            position in grouping tuple, used to filter which moves are used to
+            compute quantities. It must be None or have the same number of
+            elements than grouping. If no grouping_filter is provided it
+            returns quantities for all products.
+
+        The query return the location as first column, after the fields in
+            grouping, and the last column is the quantity.
+        """
+        pool = Pool()
+        Rule = pool.get('ir.rule')
+        Location = pool.get('stock.location')
+        Date = pool.get('ir.date')
+        Period = pool.get('stock.period')
+        Move = pool.get('stock.move')
+        Product = pool.get('product.product')
+        Template = pool.get('product.template')
+
+        move = Move.__table__()
+        product = Product.__table__()
+        template = Template.__table__()
+
+        today = Date.today()
+
+        if not location_ids:
+            return None
+        context = Transaction().context.copy()
+
+        for field in grouping:
+            if field not in Move._fields:
+                raise ValueError('"%s" has no field "%s"' % (Move, field))
+        assert grouping_filter is None or len(grouping_filter) == len(grouping)
+
+        move_rule_query = Rule.domain_get('stock.move')
+        if move_rule_query is None:
+            move_rule_query = Literal(True)
+
+        PeriodCache = Period.get_cache(grouping)
+        period = None
+        if PeriodCache:
+            period_cache = PeriodCache.__table__()
+
+        if not context.get('stock_date_end'):
+            context['stock_date_end'] = datetime.date.max
+
+        # date end in the past or today: filter on state done
+        if (context['stock_date_end'] < today
+                or (context['stock_date_end'] == today
+                    and not context.get('forecast'))):
+            state_date_clause = (
+                move.state.in_(['done',
+                        context.get('stock_assign') and 'assigned' or 'done'])
+                & (
+                    (
+                        (move.effective_date == None)
+                        & (move.planned_date <= context['stock_date_end'])
+                        )
+                    | (move.effective_date <= context['stock_date_end'])
+                    )
+                )
+        # future date end: filter move on state done and date
+        # before today, or on all state and date between today and
+        # date_end.
+        else:
+            state_date_clause = (
+                (move.state.in_(['done',
+                            context.get('stock_assign') and 'assigned'
+                            or 'done'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (move.planned_date <= today)
+                            )
+                        | (move.effective_date <= today)
+                        )
+                    )
+                | (move.state.in_(['done', 'assigned', 'draft'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (Coalesce(move.planned_date, datetime.date.max)
+                                <= context['stock_date_end'])
+                            & (Coalesce(move.planned_date, datetime.date.max)
+                                >= today)
+                            )
+                        | (
+                            (move.effective_date <= context['stock_date_end'])
+                            & (move.effective_date >= today)
+                            )
+                        )
+                    )
+                )
+
+        if context.get('stock_date_start'):
+            if context['stock_date_start'] > today:
+                state_date_clause &= (
+                    move.state.in_(['done', 'assigned', 'draft'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (
+                                (move.planned_date >=
+                                    context['stock_date_start'])
+                                | (move.planned_date == None)
+                                )
+                            )
+                        | (move.effective_date >= context['stock_date_start'])
+                        )
+                    )
+            else:
+                state_date_clause &= (
+                    (
+                        move.state.in_(['done', 'assigned', 'draft'])
+                        & (
+                            (
+                                (move.effective_date == None)
+                                & (
+                                    (move.planned_date >= today)
+                                    | (move.planned_date == None)
+                                    )
+                                )
+                            | (move.effective_date >= today)
+                            )
+                        )
+                    | (
+                        move.state.in_(['done',
+                                context.get('stock_assign') and 'assigned'
+                                or 'done'])
+                        & (
+                            (
+                                (move.effective_date == None)
+                                & (
+                                    (
+                                        (move.planned_date >=
+                                            context['stock_date_start'])
+                                        & (move.planned_date < today)
+                                        )
+                                    | (move.planned_date == None)
+                                    )
+                                )
+                            | (
+                                (move.effective_date >=
+                                    context['stock_date_start'])
+                                & (move.effective_date < today)
+                                )
+                            )
+                        )
+                    )
+        elif PeriodCache:
+            with Transaction().set_user(0, set_context=True):
+                periods = Period.search([
+                        ('date', '<', context['stock_date_end']),
+                        ('state', '=', 'closed'),
+                        ], order=[('date', 'DESC')], limit=1)
+            if periods:
+                period, = periods
+                state_date_clause &= (
+                    Coalesce(move.effective_date, move.planned_date,
+                        datetime.date.max) > period.date)
+
+        if with_childs:
+            location_query = Location.search([
+                    ('parent', 'child_of', location_ids),
+                    ], query=True, order=[])
+        else:
+            location_query = location_ids[:]
+
+        from_ = move
+        if PeriodCache:
+            from_period = period_cache
+        if grouping_filter and any(grouping_filter):
+            where = where_period = Literal(True)
+            for fieldname, grouping_ids in zip(grouping, grouping_filter):
+                if not grouping_ids:
+                    continue
+                column = Column(move, fieldname)
+                if PeriodCache:
+                    cache_column = Column(period_cache, fieldname)
+                if isinstance(grouping_ids[0], (int, long, float, Decimal)):
+                    where &= reduce_ids(column, grouping_ids)
+                    if PeriodCache:
+                        where_period &= reduce_ids(cache_column, grouping_ids)
+                else:
+                    where &= column.in_(grouping_ids)
+                    if PeriodCache:
+                        where_period &= cache_column.in_(grouping_ids)
+        else:
+            where = where_period = template.active == True
+            from_ = from_.join(product, condition=move.product == product.id)
+            from_ = from_.join(template,
+                condition=product.template == template.id)
+            if PeriodCache:
+                from_period = from_period.join(product,
+                    condition=period_cache.product == product.id)
+                from_period = from_period.join(template,
+                    condition=product.template == template.id)
+
+        if context.get('stock_destinations'):
+            destinations = context['stock_destinations']
+            dest_clause_from = move.from_location.in_(destinations)
+            dest_clause_to = move.to_location.in_(destinations)
+
+            if PeriodCache:
+                dest_clause_period = period_cache.location.in_(destinations)
+
+        else:
+            dest_clause_from = dest_clause_to = dest_clause_period = \
+                Literal(True)
+
+        # The main select clause is a union between three similar subqueries.
+        # One that sums incoming moves towards locations, one that sums
+        # outgoing moves and one for the period cache.  UNION ALL is used
+        # because we already know that there will be no duplicates.
+        move_keys = [Column(move, key).as_(key) for key in grouping]
+        query = from_.select(move.to_location.as_('location'),
+            Sum(move.internal_quantity).as_('quantity'),
+            *move_keys,
+            where=state_date_clause
+            & where
+            & move.to_location.in_(location_query)
+            & move.id.in_(move_rule_query)
+            & dest_clause_from,
+            group_by=[move.to_location] + move_keys)
+        query = Union(query, from_.select(move.from_location.as_('location'),
+                (-Sum(move.internal_quantity)).as_('quantity'),
+                *move_keys,
+                where=state_date_clause
+                & where
+                & move.from_location.in_(location_query)
+                & move.id.in_(move_rule_query)
+                & dest_clause_to,
+                group_by=[move.from_location] + move_keys),
+            all_=True)
+        if PeriodCache:
+            period_keys = [Column(period_cache, key).as_(key)
+                for key in grouping]
+            query = Union(query, from_period.select(
+                    period_cache.location.as_('location'),
+                    period_cache.internal_quantity.as_('quantity'),
+                    *period_keys,
+                    where=(period_cache.period
+                        == (period.id if period else None))
+                    & where_period
+                    & period_cache.location.in_(location_query)
+                    & dest_clause_period),
+                all_=True)
+        query_keys = [Column(query, key).as_(key) for key in grouping]
+        columns = ([query.location.as_('location')]
+            + query_keys
+            + [Sum(query.quantity).as_('quantity')])
+        query = query.select(*columns,
+            group_by=[query.location] + query_keys)
+        return query
+
+    @classmethod
+    def compute_quantities(cls, query, location_ids, with_childs=False,
+            grouping=('product',), grouping_filter=None):
+        """
+        Executes the supplied query to compute for each location and product
+        the stock quantity in the default uom of the product and rounded to
+        Uom's rounding digits.
+
+        See compute_quantites_query for params explanation.
+
+        Return a dictionary with location id and grouping as key
+            and quantity as value.
+        """
+        pool = Pool()
+        Location = pool.get('stock.location')
+        Product = pool.get('product.product')
+        Uom = pool.get('product.uom')
+
+        assert query is not None, (
+            "Query in Move.compute_quantities() can't be None")
+        assert 'product' in grouping
+
+        cursor = Transaction().cursor
+        cursor.execute(*query)
+        raw_lines = cursor.fetchall()
+
+        product_getter = operator.itemgetter(grouping.index('product') + 1)
+        res_product_ids = set()
+        quantities = {}
+        keys = set()
+        for line in raw_lines:
+            location = line[0]
+            key = tuple(line[1:-1])
+            quantity = line[-1]
+            quantities[(location,) + key] = quantity
+            res_product_ids.add(product_getter(line))
+            keys.add(key)
+
+        # Propagate quantities on from child locations to their parents
+        if with_childs:
+            # Fetch all child locations
+            locations = Location.search([
+                    ('parent', 'child_of', location_ids),
+                    ])
+            # Generate a set of locations without childs and a dict
+            # giving the parent of each location.
+            leafs = set([l.id for l in locations])
+            parent = {}
+            for location in locations:
+                if not location.parent:
+                    continue
+                if location.parent.id in leafs:
+                    leafs.remove(location.parent.id)
+                parent[location.id] = location.parent.id
+            locations = set((l.id for l in locations))
+            while leafs:
+                for l in leafs:
+                    locations.remove(l)
+                    if l not in parent:
+                        continue
+                    for key in keys:
+                        parent_key = (parent[l],) + key
+                        quantities.setdefault(parent_key, 0)
+                        quantities[parent_key] += quantities.get((l,) + key, 0)
+                next_leafs = set(locations)
+                for l in locations:
+                    if l not in parent:
+                        continue
+                    if parent[l] in next_leafs and parent[l] in locations:
+                        next_leafs.remove(parent[l])
+                leafs = next_leafs
+
+            # clean result
+            for key in quantities.keys():
+                location = key[0]
+                if location not in location_ids:
+                    del quantities[key]
+
+        # Round quantities
+        default_uom = dict((p.id, p.default_uom) for p in
+            Product.browse(list(res_product_ids)))
+        for key, quantity in quantities.iteritems():
+            location = key[0]
+            product = product_getter(key)
+            uom = default_uom[product]
+            quantities[key] = Uom.round(quantity, uom.rounding)
+
+        return quantities
