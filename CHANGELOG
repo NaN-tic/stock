@@ -1,24 +1,46 @@
-Version 1.6.7 - 2012-11-05
-* Bug fixes (see mercurial logs for details)
+* Allow to define the effective date of shipments
+* Prevent changing product type if stock moves exist
+* Use new methods to compute quantities in StockMixin._search_quantity()
+* Split products_by_location into two methods on Move:
+  compute_quantities_query and compute_quantities
+* Use origin for inventory moves
+* Allow partial assignation on Supplier Shipment Return
 
-Version 1.6.6 - 2012-09-02
+Version 3.0.0 - 2013-10-21
 * Bug fixes (see mercurial logs for details)
+* Add Mixin class with helper to setup stock quantity fields
+* Allow to customize move creation of Inventory
+* Allow to customize unique constraint on Inventory
+* Allow specific grouping Period Cache
+* Add grouping on products_by_location and assign_try
 
-Version 1.6.5 - 2012-05-07
+Version 2.8.0 - 2013-04-22
 * Bug fixes (see mercurial logs for details)
+* Merge all shipment Many2One into shipment Reference
+* Add origin Reference on Stock Move
+* Add workflow to stock move
 
-Version 1.6.4 - 2011-12-26
+Version 2.6.0 - 2012-10-22
 * Bug fixes (see mercurial logs for details)
+* Add Product Quantities By Warehouse
 
-Version 1.6.3 - 2011-05-29
+Version 2.4.0 - 2012-04-24
 * Bug fixes (see mercurial logs for details)
+* Remove special to_location_warehouse search clause
+* Remove default from and to location and instead use domain
+* Update cost_price only from supplier to storage
 
-Version 1.6.2 - 2010-11-02
+Version 2.2.0 - 2011-10-25
 * Bug fixes (see mercurial logs for details)
+* Ensure coherence between planned date of shipments and moves
 
-Version 1.6.1 - 2010-08-31
+Version 2.0.0 - 2011-04-27
 * Bug fixes (see mercurial logs for details)
-* Security fix to use safe_eval instead of eval
+* Add period to reduce data computation
+* Add internal_quantity on move to speedup computation
+
+Version 1.8.0 - 2010-11-01
+* Bug fixes (see mercurial logs for details)
 
 Version 1.6.0 - 2010-05-11
 * Bug fixes (see mercurial logs for details)
