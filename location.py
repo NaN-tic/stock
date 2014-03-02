@@ -244,8 +244,9 @@ class Location(ModelSQL, ModelView):
         return locations
 
     @classmethod
-    def write(cls, locations, vals):
-        super(Location, cls).write(locations, vals)
+    def write(cls, *args):
+        super(Location, cls).write(*args)
+        locations = sum(args[::2], [])
         cls._set_warehouse_parent(locations)
 
         ids = [l.id for l in locations]
@@ -312,8 +313,9 @@ class Location(ModelSQL, ModelView):
                     default=default)
                 warehouse_locations = Transaction().context.get(
                     'cp_warehouse_locations') or {}
-                cp_warehouse = cls(Transaction().context['cp_warehouse_id'])
                 if location.id in warehouse_locations.values():
+                    cp_warehouse = cls(
+                        Transaction().context['cp_warehouse_id'])
                     for field, loc_id in warehouse_locations.iteritems():
                         if loc_id == location.id:
                             cls.write([cp_warehouse], {

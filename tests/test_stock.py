@@ -1,14 +1,5 @@
-#!/usr/bin/env python
 #This file is part of Tryton.  The COPYRIGHT file at the top level of
 #this repository contains the full copyright notices and license terms.
-
-import sys
-import os
-DIR = os.path.abspath(os.path.normpath(os.path.join(__file__,
-    '..', '..', '..', '..', '..', 'trytond')))
-if os.path.isdir(DIR):
-    sys.path.insert(0, os.path.dirname(DIR))
-
 import unittest
 import doctest
 import datetime
@@ -17,15 +8,12 @@ from dateutil.relativedelta import relativedelta
 from functools import partial
 import trytond.tests.test_tryton
 from trytond.tests.test_tryton import POOL, DB_NAME, USER, CONTEXT, test_view,\
-    test_depends
-from trytond.backend.sqlite.database import Database as SQLiteDatabase
+    test_depends, doctest_dropdb
 from trytond.transaction import Transaction
 
 
 class StockTestCase(unittest.TestCase):
-    '''
-    Test Stock module.
-    '''
+    'Test Stock module'
 
     def setUp(self):
         trytond.tests.test_tryton.install_module('stock')
@@ -41,21 +29,15 @@ class StockTestCase(unittest.TestCase):
         self.cache = POOL.get('stock.period.cache')
 
     def test0005views(self):
-        '''
-        Test views.
-        '''
+        'Test views'
         test_view('stock')
 
     def test0006depends(self):
-        '''
-        Test depends.
-        '''
+        'Test depends'
         test_depends()
 
     def test0010move_internal_quantity(self):
-        '''
-        Test Move.internal_quantity.
-        '''
+        'Test Move.internal_quantity'
         with Transaction().start(DB_NAME, USER, context=CONTEXT):
             category, = self.category.create([{
                         'name': 'Test Move.internal_quantity',
@@ -76,7 +58,9 @@ class StockTestCase(unittest.TestCase):
                         }])
             supplier, = self.location.search([('code', '=', 'SUP')])
             storage, = self.location.search([('code', '=', 'STO')])
-            company, = self.company.search([('rec_name', '=', 'B2CK')])
+            company, = self.company.search([
+                    ('rec_name', '=', 'Dunder Mifflin'),
+                    ])
             currency = company.currency
             self.user.write([self.user(USER)], {
                 'main_company': company.id,
@@ -112,9 +96,7 @@ class StockTestCase(unittest.TestCase):
                         internal_quantity)
 
     def test0020products_by_location(self):
-        '''
-        Test products_by_location.
-        '''
+        'Test products_by_location'
         with Transaction().start(DB_NAME, USER,
                 context=CONTEXT) as transaction:
             category, = self.category.create([{
@@ -137,7 +119,9 @@ class StockTestCase(unittest.TestCase):
             supplier, = self.location.search([('code', '=', 'SUP')])
             customer, = self.location.search([('code', '=', 'CUS')])
             storage, = self.location.search([('code', '=', 'STO')])
-            company, = self.company.search([('rec_name', '=', 'B2CK')])
+            company, = self.company.search([
+                    ('rec_name', '=', 'Dunder Mifflin'),
+                    ])
             currency = company.currency
             self.user.write([self.user(USER)], {
                 'main_company': company.id,
@@ -280,6 +264,62 @@ class StockTestCase(unittest.TestCase):
                     else:
                         self.assertEqual(product_reloaded.quantity, quantity)
 
+            def tests_product_search_quantity(context, quantity):
+                with transaction.set_context(locations=[storage.id]):
+                    if (not context.get('stock_date_end')
+                            or context['stock_date_end'] > today
+                            or context.get('forecast')):
+                        fname = 'forecast_quantity'
+                    else:
+                        fname = 'quantity'
+                    found_products = self.product.search([
+                            (fname, '=', quantity),
+                            ])
+                    self.assertIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, '!=', quantity),
+                            ])
+                    self.assertNotIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, 'in', (quantity, quantity + 1)),
+                            ])
+                    self.assertIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, 'not in', (quantity, quantity + 1)),
+                            ])
+                    self.assertNotIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, '<', quantity),
+                            ])
+                    self.assertNotIn(product, found_products)
+                    found_products = self.product.search([
+                            (fname, '<', quantity + 1),
+                            ])
+                    self.assertIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, '>', quantity),
+                            ])
+                    self.assertNotIn(product, found_products)
+                    found_products = self.product.search([
+                            (fname, '>', quantity - 1),
+                            ])
+                    self.assertIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, '>=', quantity),
+                            ])
+                    self.assertIn(product, found_products)
+
+                    found_products = self.product.search([
+                            (fname, '<=', quantity),
+                            ])
+                    self.assertIn(product, found_products)
+
             def test_products_by_location():
                 for context, quantity in tests:
                     with transaction.set_context(context):
@@ -289,6 +329,7 @@ class StockTestCase(unittest.TestCase):
                             self.assertEqual(products_by_location(),
                                     {(storage.id, product.id): quantity})
                             tests_product_quantity(context, quantity)
+                            tests_product_search_quantity(context, quantity)
 
             test_products_by_location()
 
@@ -328,7 +369,9 @@ class StockTestCase(unittest.TestCase):
         # Test with_childs
         with Transaction().start(DB_NAME, USER,
                 context=CONTEXT) as transaction:
-            company, = self.company.search([('rec_name', '=', 'B2CK')])
+            company, = self.company.search([
+                    ('rec_name', '=', 'Dunder Mifflin'),
+                    ])
             self.user.write([self.user(USER)], {
                 'main_company': company.id,
                 'company': company.id,
@@ -384,9 +427,7 @@ class StockTestCase(unittest.TestCase):
                 1)
 
     def test0030period(self):
-        '''
-        Test period.
-        '''
+        'Test period'
         with Transaction().start(DB_NAME, USER,
                 context=CONTEXT) as transaction:
             category, = self.category.create([{
@@ -408,7 +449,9 @@ class StockTestCase(unittest.TestCase):
             supplier, = self.location.search([('code', '=', 'SUP')])
             customer, = self.location.search([('code', '=', 'CUS')])
             storage, = self.location.search([('code', '=', 'STO')])
-            company, = self.company.search([('rec_name', '=', 'B2CK')])
+            company, = self.company.search([
+                    ('rec_name', '=', 'Dunder Mifflin'),
+                    ])
             currency = company.currency
             self.user.write([self.user(USER)], {
                 'main_company': company.id,
@@ -559,19 +602,6 @@ class StockTestCase(unittest.TestCase):
             self.assertRaises(Exception, self.period.close, [period])
 
 
-def doctest_dropdb(test):
-    '''
-    Remove sqlite memory database
-    '''
-    database = SQLiteDatabase().connect()
-    cursor = database.cursor(autocommit=True)
-    try:
-        database.drop(cursor, ':memory:')
-        cursor.commit()
-    finally:
-        cursor.close()
-
-
 def suite():
     suite = trytond.tests.test_tryton.suite()
     from trytond.modules.company.tests import test_company
@@ -586,7 +616,8 @@ def suite():
             'scenario_stock_average_cost_price.rst',
             setUp=doctest_dropdb, tearDown=doctest_dropdb, encoding='utf-8',
             optionflags=doctest.REPORT_ONLY_FIRST_FAILURE))
+    suite.addTests(doctest.DocFileSuite(
+            'scenario_stock_inventory.rst',
+            setUp=doctest_dropdb, tearDown=doctest_dropdb, encoding='utf-8',
+            optionflags=doctest.REPORT_ONLY_FIRST_FAILURE))
     return suite
-
-if __name__ == '__main__':
-    unittest.TextTestRunner(verbosity=2).run(suite())

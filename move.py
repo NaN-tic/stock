@@ -4,12 +4,15 @@ import datetime
 import operator
 from decimal import Decimal
 from functools import partial
-from sql import Column
+from sql import Literal, Union, Column
+from sql.aggregate import Sum
+from sql.conditionals import Coalesce
 from sql.operators import Concat
 
 from trytond.model import Workflow, Model, ModelView, ModelSQL, fields
 from trytond import backend
-from trytond.pyson import In, Eval, Not, Equal, If, Get, Bool
+from trytond.pyson import In, Eval, Not, Equal, If, Bool
+from trytond.tools import reduce_ids
 from trytond.transaction import Transaction
 from trytond.pool import Pool
 
@@ -49,7 +52,7 @@ class StockMixin:
         product.
 
         location_ids is the list of IDs of locations to take account to compute
-            the stock. It can't be empty.
+            the stock.
         products restrict the stock computation to the this products (more
             efficient), so it should be the products related to records.
             If it is None all products are used.
@@ -88,50 +91,59 @@ class StockMixin:
         Compute the domain to filter records which validates the domain over
         quantity field.
 
+        The context with keys:
+            stock_skip_warehouse: if set, quantities on a warehouse are no more
+                quantities of all child locations but quantities of the storage
+                zone.
         location_ids is the list of IDs of locations to take account to compute
-            the stock. It can't be empty.
+            the stock.
         grouping defines how stock moves are grouped.
         position defines which field of grouping corresponds to the record
             whose quantity is computed.
         """
         pool = Pool()
-        Product = pool.get('product.product')
+        Location = pool.get('stock.location')
+        Move = pool.get('stock.move')
 
         if not location_ids or not domain:
             return []
 
-        def _search_quantity_eval_domain(line, domain):
-            operator_funcs = {
-                '=': operator.eq,
-                '>=': operator.ge,
-                '>': operator.gt,
-                '<=': operator.le,
-                '<': operator.lt,
-                '!=': operator.ne,
-                'in': lambda v, l: v in l,
-                'not in': lambda v, l: v not in l,
-                }
-
-            field, op, operand = domain
-            value = line.get(field)
-            return operator_funcs[op](value, operand)
+        # Skip warehouse location in favor of their storage location
+        # to compute quantities. Keep track of which ids to remove
+        # and to add after the query.
+        if Transaction().context.get('stock_skip_warehouse'):
+            location_ids = set(location_ids)
+            for location in Location.browse(list(location_ids)):
+                if location.type == 'warehouse':
+                    location_ids.remove(location.id)
+                    location_ids.add(location.storage_location.id)
+            location_ids = list(location_ids)
 
         with Transaction().set_context(cls._quantity_context(name)):
-            pbl = Product.products_by_location(
-                location_ids=location_ids,
-                with_childs=True, grouping=grouping)
+            query = Move.compute_quantities_query(location_ids,
+                with_childs=True, grouping=grouping,
+                grouping_filter=None)
+            having_domain = getattr(cls, name)._field.convert_domain(domain, {
+                    None: (query, {}),
+                    }, cls)
+            # The last column of 'query' is always the quantity for the 'key'.
+            # It is computed with a SUM() aggregator so in having we have to
+            # use the SUM() expression and not the name of column
+            having_domain.left = query.columns[-1].expression
+            if query.having:
+                query.having &= having_domain
+            else:
+                query.having = having_domain
+            quantities = Move.compute_quantities(query, location_ids,
+                with_childs=True, grouping=grouping,
+                grouping_filter=None)
 
-        processed_lines = []
-        for key, quantity in pbl.iteritems():
+        record_ids = []
+        for key, quantity in quantities.iteritems():
             # pbl could return None in some keys
             if key[position] is not None:
-                processed_lines.append({
-                        'record_id': key[position],
-                        name: quantity,
-                        })
+                record_ids.append(key[position])
 
-        record_ids = [line['record_id'] for line in processed_lines
-            if _search_quantity_eval_domain(line, domain)]
         return [('id', 'in', record_ids)]
 
 
@@ -141,23 +153,18 @@ class Move(Workflow, ModelSQL, ModelView):
     _order_name = 'product'
     product = fields.Many2One("product.product", "Product", required=True,
         select=True, states=STATES,
-        on_change=['product', 'currency', 'uom', 'company',
-            'from_location', 'to_location'],
         domain=[('type', '!=', 'service')],
         depends=DEPENDS)
     product_uom_category = fields.Function(
-        fields.Many2One('product.uom.category', 'Product Uom Category',
-            on_change_with=['product']),
+        fields.Many2One('product.uom.category', 'Product Uom Category'),
         'on_change_with_product_uom_category')
     uom = fields.Many2One("product.uom", "Uom", required=True, states=STATES,
         domain=[
             ('category', '=', Eval('product_uom_category')),
             ],
-        on_change=['product', 'currency', 'uom', 'company',
-            'from_location', 'to_location'],
         depends=['state', 'product_uom_category'])
-    unit_digits = fields.Function(fields.Integer('Unit Digits',
-        on_change_with=['uom']), 'on_change_with_unit_digits')
+    unit_digits = fields.Function(fields.Integer('Unit Digits'),
+        'on_change_with_unit_digits')
     quantity = fields.Float("Quantity", required=True,
         digits=(16, Eval('unit_digits', 2)), states=STATES,
         depends=['state', 'unit_digits'])
@@ -181,7 +188,11 @@ class Move(Workflow, ModelSQL, ModelView):
                 | Eval('shipment'))
             }, depends=['state', 'shipment'],
         select=True)
-    effective_date = fields.Date("Effective Date", readonly=True, select=True)
+    effective_date = fields.Date("Effective Date", readonly=True, select=True,
+        states={
+            'required': Eval('state') == 'done',
+            },
+        depends=['state'])
     state = fields.Selection([
         ('draft', 'Draft'),
         ('assigned', 'Assigned'),
@@ -212,8 +223,7 @@ class Move(Workflow, ModelSQL, ModelView):
             'readonly': Not(Equal(Eval('state'), 'draft')),
             },
         depends=['unit_price_required', 'state'])
-    unit_price_required = fields.Function(fields.Boolean('Unit Price Required',
-        on_change_with=['from_location', 'to_location']),
+    unit_price_required = fields.Function(fields.Boolean('Unit Price Required'),
         'on_change_with_unit_price_required')
 
     @classmethod
@@ -364,11 +374,14 @@ class Move(Workflow, ModelSQL, ModelView):
     def default_unit_digits():
         return 2
 
+    @fields.depends('uom')
     def on_change_with_unit_digits(self, name=None):
         if self.uom:
             return self.uom.digits
         return 2
 
+    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
+        'to_location')
     def on_change_product(self):
         pool = Pool()
         Uom = pool.get('product.uom')
@@ -397,10 +410,13 @@ class Move(Workflow, ModelSQL, ModelView):
                 res['unit_price'] = unit_price
         return res
 
+    @fields.depends('product')
     def on_change_with_product_uom_category(self, name=None):
         if self.product:
             return self.product.default_uom_category.id
 
+    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
+        'to_location')
     def on_change_uom(self):
         pool = Pool()
         Uom = pool.get('product.uom')
@@ -421,6 +437,7 @@ class Move(Workflow, ModelSQL, ModelView):
                 res['unit_price'] = unit_price
         return res
 
+    @fields.depends('from_location', 'to_location')
     def on_change_with_unit_price_required(self, name=None):
         if (self.from_location
                 and self.from_location.type in ('supplier', 'production')):
@@ -457,7 +474,7 @@ class Move(Workflow, ModelSQL, ModelView):
     @staticmethod
     def _get_origin():
         'Return list of Model names for origin Reference'
-        return []
+        return ['stock.inventory.line']
 
     @classmethod
     def get_origin(cls):
@@ -565,36 +582,37 @@ class Move(Workflow, ModelSQL, ModelView):
             product.default_uom, round=True)
         return internal_quantity
 
+    def set_effective_date(self):
+        pool = Pool()
+        Date = pool.get('ir.date')
+
+        if not self.effective_date and self.shipment:
+            self.effective_date = self.shipment.effective_date
+        if not self.effective_date:
+            self.effective_date = Date.today()
+
     @classmethod
     @ModelView.button
     @Workflow.transition('draft')
     def draft(cls, moves):
-        pass
+        cls.write(moves, {
+                'effective_date': None,
+                })
 
     @classmethod
     @ModelView.button
     @Workflow.transition('assigned')
     def assign(cls, moves):
-        pool = Pool()
-        Date = pool.get('ir.date')
-
-        today = Date.today()
         for move in moves:
-            if not move.effective_date:
-                move.effective_date = today
+            move.set_effective_date()
             move.save()
 
     @classmethod
     @ModelView.button
     @Workflow.transition('done')
     def do(cls, moves):
-        pool = Pool()
-        Date = pool.get('ir.date')
-
-        today = Date.today()
         for move in moves:
-            if not move.effective_date:
-                move.effective_date = today
+            move.set_effective_date()
             if (move.from_location.type in ('supplier', 'production')
                     and move.to_location.type == 'storage'
                     and move.product.cost_price_method == 'average'):
@@ -648,31 +666,35 @@ class Move(Workflow, ModelSQL, ModelView):
         return moves
 
     @classmethod
-    def write(cls, moves, vals):
-        vals_set = set(vals)
-        if cls._deny_modify_assigned & vals_set:
+    def write(cls, *args):
+        actions = iter(args)
+        for moves, values in zip(actions, actions):
+            vals_set = set(values)
+            if cls._deny_modify_assigned & vals_set:
+                for move in moves:
+                    if move.state == 'assigned':
+                        cls.raise_user_error('modify_assigned', move.rec_name)
+            if cls._deny_modify_done_cancel & vals_set:
+                for move in moves:
+                    if move.state in ('done', 'cancel'):
+                        cls.raise_user_error('modify_done_cancel',
+                            (move.rec_name,))
+
+        super(Move, cls).write(*args)
+
+        actions = iter(args)
+        for moves, values in zip(actions, actions):
+            if any(f not in cls._allow_modify_closed_period for f in values):
+                cls.check_period_closed(moves)
             for move in moves:
-                if move.state == 'assigned':
-                    cls.raise_user_error('modify_assigned', (move.rec_name,))
-        if cls._deny_modify_done_cancel & vals_set:
-            for move in moves:
-                if move.state in ('done', 'cancel'):
-                    cls.raise_user_error('modify_done_cancel',
-                        (move.rec_name,))
-
-        if any(f not in cls._allow_modify_closed_period for f in vals):
-            cls.check_period_closed(moves)
-
-        super(Move, cls).write(moves, vals)
-
-        for move in moves:
-            internal_quantity = cls._get_internal_quantity(move.quantity,
-                    move.uom, move.product)
-            if (internal_quantity != move.internal_quantity
-                    and internal_quantity != vals.get('internal_quantity')):
-                cls.write([move], {
-                        'internal_quantity': internal_quantity,
-                        })
+                internal_quantity = cls._get_internal_quantity(move.quantity,
+                        move.uom, move.product)
+                if (internal_quantity != move.internal_quantity
+                        and internal_quantity
+                        != values.get('internal_quantity')):
+                    cls.write([move], {
+                            'internal_quantity': internal_quantity,
+                            })
 
     @classmethod
     def delete(cls, moves):
@@ -706,7 +728,7 @@ class Move(Workflow, ModelSQL, ModelView):
         return to_pick
 
     @classmethod
-    def assign_try(cls, moves, grouping=('product',)):
+    def assign_try(cls, moves, with_childs=True, grouping=('product',)):
         '''
         Try to assign moves.
         It will split the moves to assign as much possible.
@@ -720,9 +742,13 @@ class Move(Workflow, ModelSQL, ModelView):
 
         Transaction().cursor.lock(cls._table)
 
-        locations = Location.search([
-                ('parent', 'child_of', [x.from_location.id for x in moves]),
-                ])
+        if with_childs:
+            locations = Location.search([
+                    ('parent', 'child_of',
+                        [x.from_location.id for x in moves]),
+                    ])
+        else:
+            locations = list(set((m.from_location for m in moves)))
         with Transaction().set_context(
                 stock_date_end=Date.today(),
                 stock_assign=True):
@@ -746,9 +772,12 @@ class Move(Workflow, ModelSQL, ModelView):
                 continue
             to_location = move.to_location
             location_qties = {}
-            childs = Location.search([
-                    ('parent', 'child_of', [move.from_location.id]),
-                    ])
+            if with_childs:
+                childs = Location.search([
+                        ('parent', 'child_of', [move.from_location.id]),
+                        ])
+            else:
+                childs = [move.from_location]
             for location in childs:
                 key = get_key(location)
                 if key in pbl:
@@ -789,3 +818,367 @@ class Move(Workflow, ModelSQL, ModelView):
                 pbl[from_key] = pbl.get(from_key, 0.0) - qty_default_uom
                 pbl[to_key] = pbl.get(to_key, 0.0) + qty_default_uom
         return success
+
+    @classmethod
+    def compute_quantities_query(cls, location_ids, with_childs=False,
+            grouping=('product',), grouping_filter=None):
+        """
+        Prepare a query object to compute for each location and product the
+        stock quantity in the default uom of the product.
+
+        The context with keys:
+            stock_date_end: if set the date of the stock computation.
+            stock_date_start: if set return the delta of the stock between the
+                two dates, (ignored if stock_date_end is missing).
+            stock_assign: if set compute also the assigned moves as done.
+            forecast: if set compute the forecast quantity.
+            stock_destinations: A list of location ids. If set, restrict the
+                computation to moves from and to those locations.
+            stock_skip_warehouse: if set, quantities on a warehouse are no more
+                quantities of all child locations but quantities of the storage
+                zone.
+        If with_childs, it computes also for child locations.
+        grouping is a tuple of Move field names and defines how stock moves are
+            grouped.
+        grouping_filter is a tuple of values, for the Move's field at the same
+            position in grouping tuple, used to filter which moves are used to
+            compute quantities. It must be None or have the same number of
+            elements than grouping. If no grouping_filter is provided it
+            returns quantities for all products.
+
+        The query return the location as first column, after the fields in
+            grouping, and the last column is the quantity.
+        """
+        pool = Pool()
+        Rule = pool.get('ir.rule')
+        Location = pool.get('stock.location')
+        Date = pool.get('ir.date')
+        Period = pool.get('stock.period')
+        Move = pool.get('stock.move')
+        Product = pool.get('product.product')
+        Template = pool.get('product.template')
+
+        move = Move.__table__()
+        product = Product.__table__()
+        template = Template.__table__()
+
+        today = Date.today()
+
+        if not location_ids:
+            return None
+        context = Transaction().context.copy()
+
+        for field in grouping:
+            if field not in Move._fields:
+                raise ValueError('"%s" has no field "%s"' % (Move, field))
+        assert grouping_filter is None or len(grouping_filter) == len(grouping)
+
+        move_rule_query = Rule.domain_get('stock.move')
+        if move_rule_query is None:
+            move_rule_query = Literal(True)
+
+        PeriodCache = Period.get_cache(grouping)
+        period = None
+        if PeriodCache:
+            period_cache = PeriodCache.__table__()
+
+        if not context.get('stock_date_end'):
+            context['stock_date_end'] = datetime.date.max
+
+        # date end in the past or today: filter on state done
+        if (context['stock_date_end'] < today
+                or (context['stock_date_end'] == today
+                    and not context.get('forecast'))):
+            state_date_clause = (
+                move.state.in_(['done',
+                        context.get('stock_assign') and 'assigned' or 'done'])
+                & (
+                    (
+                        (move.effective_date == None)
+                        & (move.planned_date <= context['stock_date_end'])
+                        )
+                    | (move.effective_date <= context['stock_date_end'])
+                    )
+                )
+        # future date end: filter move on state done and date
+        # before today, or on all state and date between today and
+        # date_end.
+        else:
+            state_date_clause = (
+                (move.state.in_(['done',
+                            context.get('stock_assign') and 'assigned'
+                            or 'done'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (move.planned_date <= today)
+                            )
+                        | (move.effective_date <= today)
+                        )
+                    )
+                | (move.state.in_(['done', 'assigned', 'draft'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (Coalesce(move.planned_date, datetime.date.max)
+                                <= context['stock_date_end'])
+                            & (Coalesce(move.planned_date, datetime.date.max)
+                                >= today)
+                            )
+                        | (
+                            (move.effective_date <= context['stock_date_end'])
+                            & (move.effective_date >= today)
+                            )
+                        )
+                    )
+                )
+
+        if context.get('stock_date_start'):
+            if context['stock_date_start'] > today:
+                state_date_clause &= (
+                    move.state.in_(['done', 'assigned', 'draft'])
+                    & (
+                        (
+                            (move.effective_date == None)
+                            & (
+                                (move.planned_date >=
+                                    context['stock_date_start'])
+                                | (move.planned_date == None)
+                                )
+                            )
+                        | (move.effective_date >= context['stock_date_start'])
+                        )
+                    )
+            else:
+                state_date_clause &= (
+                    (
+                        move.state.in_(['done', 'assigned', 'draft'])
+                        & (
+                            (
+                                (move.effective_date == None)
+                                & (
+                                    (move.planned_date >= today)
+                                    | (move.planned_date == None)
+                                    )
+                                )
+                            | (move.effective_date >= today)
+                            )
+                        )
+                    | (
+                        move.state.in_(['done',
+                                context.get('stock_assign') and 'assigned'
+                                or 'done'])
+                        & (
+                            (
+                                (move.effective_date == None)
+                                & (
+                                    (
+                                        (move.planned_date >=
+                                            context['stock_date_start'])
+                                        & (move.planned_date < today)
+                                        )
+                                    | (move.planned_date == None)
+                                    )
+                                )
+                            | (
+                                (move.effective_date >=
+                                    context['stock_date_start'])
+                                & (move.effective_date < today)
+                                )
+                            )
+                        )
+                    )
+        elif PeriodCache:
+            with Transaction().set_user(0, set_context=True):
+                periods = Period.search([
+                        ('date', '<', context['stock_date_end']),
+                        ('state', '=', 'closed'),
+                        ], order=[('date', 'DESC')], limit=1)
+            if periods:
+                period, = periods
+                state_date_clause &= (
+                    Coalesce(move.effective_date, move.planned_date,
+                        datetime.date.max) > period.date)
+
+        if with_childs:
+            location_query = Location.search([
+                    ('parent', 'child_of', location_ids),
+                    ], query=True, order=[])
+        else:
+            location_query = location_ids[:]
+
+        from_ = move
+        if PeriodCache:
+            from_period = period_cache
+        if grouping_filter and any(grouping_filter):
+            where = where_period = Literal(True)
+            for fieldname, grouping_ids in zip(grouping, grouping_filter):
+                if not grouping_ids:
+                    continue
+                column = Column(move, fieldname)
+                if PeriodCache:
+                    cache_column = Column(period_cache, fieldname)
+                if isinstance(grouping_ids[0], (int, long, float, Decimal)):
+                    where &= reduce_ids(column, grouping_ids)
+                    if PeriodCache:
+                        where_period &= reduce_ids(cache_column, grouping_ids)
+                else:
+                    where &= column.in_(grouping_ids)
+                    if PeriodCache:
+                        where_period &= cache_column.in_(grouping_ids)
+        else:
+            where = where_period = template.active == True
+            from_ = from_.join(product, condition=move.product == product.id)
+            from_ = from_.join(template,
+                condition=product.template == template.id)
+            if PeriodCache:
+                from_period = from_period.join(product,
+                    condition=period_cache.product == product.id)
+                from_period = from_period.join(template,
+                    condition=product.template == template.id)
+
+        if context.get('stock_destinations'):
+            destinations = context['stock_destinations']
+            dest_clause_from = move.from_location.in_(destinations)
+            dest_clause_to = move.to_location.in_(destinations)
+
+            if PeriodCache:
+                dest_clause_period = period_cache.location.in_(destinations)
+
+        else:
+            dest_clause_from = dest_clause_to = dest_clause_period = \
+                Literal(True)
+
+        # The main select clause is a union between three similar subqueries.
+        # One that sums incoming moves towards locations, one that sums
+        # outgoing moves and one for the period cache.  UNION ALL is used
+        # because we already know that there will be no duplicates.
+        move_keys = [Column(move, key).as_(key) for key in grouping]
+        query = from_.select(move.to_location.as_('location'),
+            Sum(move.internal_quantity).as_('quantity'),
+            *move_keys,
+            where=state_date_clause
+            & where
+            & move.to_location.in_(location_query)
+            & move.id.in_(move_rule_query)
+            & dest_clause_from,
+            group_by=[move.to_location] + move_keys)
+        query = Union(query, from_.select(move.from_location.as_('location'),
+                (-Sum(move.internal_quantity)).as_('quantity'),
+                *move_keys,
+                where=state_date_clause
+                & where
+                & move.from_location.in_(location_query)
+                & move.id.in_(move_rule_query)
+                & dest_clause_to,
+                group_by=[move.from_location] + move_keys),
+            all_=True)
+        if PeriodCache:
+            period_keys = [Column(period_cache, key).as_(key)
+                for key in grouping]
+            query = Union(query, from_period.select(
+                    period_cache.location.as_('location'),
+                    period_cache.internal_quantity.as_('quantity'),
+                    *period_keys,
+                    where=(period_cache.period
+                        == (period.id if period else None))
+                    & where_period
+                    & period_cache.location.in_(location_query)
+                    & dest_clause_period),
+                all_=True)
+        query_keys = [Column(query, key).as_(key) for key in grouping]
+        columns = ([query.location.as_('location')]
+            + query_keys
+            + [Sum(query.quantity).as_('quantity')])
+        query = query.select(*columns,
+            group_by=[query.location] + query_keys)
+        return query
+
+    @classmethod
+    def compute_quantities(cls, query, location_ids, with_childs=False,
+            grouping=('product',), grouping_filter=None):
+        """
+        Executes the supplied query to compute for each location and product
+        the stock quantity in the default uom of the product and rounded to
+        Uom's rounding digits.
+
+        See compute_quantites_query for params explanation.
+
+        Return a dictionary with location id and grouping as key
+            and quantity as value.
+        """
+        pool = Pool()
+        Location = pool.get('stock.location')
+        Product = pool.get('product.product')
+        Uom = pool.get('product.uom')
+
+        assert query is not None, (
+            "Query in Move.compute_quantities() can't be None")
+        assert 'product' in grouping
+
+        cursor = Transaction().cursor
+        cursor.execute(*query)
+        raw_lines = cursor.fetchall()
+
+        product_getter = operator.itemgetter(grouping.index('product') + 1)
+        res_product_ids = set()
+        quantities = {}
+        keys = set()
+        for line in raw_lines:
+            location = line[0]
+            key = tuple(line[1:-1])
+            quantity = line[-1]
+            quantities[(location,) + key] = quantity
+            res_product_ids.add(product_getter(line))
+            keys.add(key)
+
+        # Propagate quantities on from child locations to their parents
+        if with_childs:
+            # Fetch all child locations
+            locations = Location.search([
+                    ('parent', 'child_of', location_ids),
+                    ])
+            # Generate a set of locations without childs and a dict
+            # giving the parent of each location.
+            leafs = set([l.id for l in locations])
+            parent = {}
+            for location in locations:
+                if not location.parent:
+                    continue
+                if location.parent.id in leafs:
+                    leafs.remove(location.parent.id)
+                parent[location.id] = location.parent.id
+            locations = set((l.id for l in locations))
+            while leafs:
+                for l in leafs:
+                    locations.remove(l)
+                    if l not in parent:
+                        continue
+                    for key in keys:
+                        parent_key = (parent[l],) + key
+                        quantities.setdefault(parent_key, 0)
+                        quantities[parent_key] += quantities.get((l,) + key, 0)
+                next_leafs = set(locations)
+                for l in locations:
+                    if l not in parent:
+                        continue
+                    if parent[l] in next_leafs and parent[l] in locations:
+                        next_leafs.remove(parent[l])
+                leafs = next_leafs
+
+            # clean result
+            for key in quantities.keys():
+                location = key[0]
+                if location not in location_ids:
+                    del quantities[key]
+
+        # Round quantities
+        default_uom = dict((p.id, p.default_uom) for p in
+            Product.browse(list(res_product_ids)))
+        for key, quantity in quantities.iteritems():
+            location = key[0]
+            product = product_getter(key)
+            uom = default_uom[product]
+            quantities[key] = Uom.round(quantity, uom.rounding)
+
+        return quantities

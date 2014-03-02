@@ -13,6 +13,7 @@ Imports::
     >>> from decimal import Decimal
     >>> from proteus import config, Model, Wizard
     >>> today = datetime.date.today()
+    >>> yesterday = today - relativedelta(days=1)
 
 Create database::
 
@@ -35,14 +36,14 @@ Create company::
     >>> company_config = Wizard('company.company.config')
     >>> company_config.execute('company')
     >>> company = company_config.form
-    >>> party = Party(name='OPENLABS')
+    >>> party = Party(name='Dunder Mifflin')
     >>> party.save()
     >>> company.party = party
-    >>> currencies = Currency.find([('code', '=', 'EUR')])
+    >>> currencies = Currency.find([('code', '=', 'USD')])
     >>> if not currencies:
-    ...     currency = Currency(name='Euro', symbol=u'€', code='EUR',
+    ...     currency = Currency(name='U.S. Dollar', symbol='$', code='USD',
     ...         rounding=Decimal('0.01'), mon_grouping='[3, 3, 0]',
-    ...         mon_decimal_point=',')
+    ...         mon_decimal_point='.', mon_thousands_sep=',')
     ...     currency.save()
     ...     CurrencyRate(date=today + relativedelta(month=1, day=1),
     ...         rate=Decimal('1.0'), currency=currency).save()
@@ -158,6 +159,14 @@ Assign the shipment now::
     >>> states.sort()
     >>> states
     [u'assigned', u'draft']
+    >>> effective_dates = [m.effective_date for m in
+    ...     shipment_out.inventory_moves]
+    >>> effective_dates == [today, None]
+    True
+    >>> planned_dates = [m.planned_date for m in
+    ...     shipment_out.outgoing_moves]
+    >>> planned_dates == [today, today]
+    True
 
 Delete the draft move, assign and pack shipment::
 
@@ -188,6 +197,14 @@ Set the state as Done::
     >>> shipment_out.reload()
     >>> set([m.state for m in shipment_out.outgoing_moves])
     set([u'done'])
+    >>> planned_dates = [m.planned_date for m in
+    ...     shipment_out.outgoing_moves]
+    >>> planned_dates == [today, today]
+    True
+    >>> effective_dates = [m.effective_date for m in
+    ...     shipment_out.outgoing_moves]
+    >>> effective_dates == [today, today]
+    True
     >>> len(shipment_out.outgoing_moves)
     2
     >>> len(shipment_out.inventory_moves)
@@ -197,3 +214,56 @@ Set the state as Done::
     >>> sum([m.quantity for m in shipment_out.inventory_moves]) == \
     ...     sum([m.quantity for m in shipment_out.outgoing_moves])
     True
+
+Create Shipment Out with effective date::
+
+    >>> ShipmentOut = Model.get('stock.shipment.out')
+    >>> shipment_out = ShipmentOut()
+    >>> shipment_out.planned_date = yesterday
+    >>> shipment_out.effective_date = yesterday
+    >>> shipment_out.customer = customer
+    >>> shipment_out.warehouse = warehouse_loc
+    >>> shipment_out.company = company
+    >>> move = shipment_out.outgoing_moves.new()
+    >>> move.product = product
+    >>> move.uom =unit
+    >>> move.quantity = 1
+    >>> move.from_location = output_loc
+    >>> move.to_location = customer_loc
+    >>> move.company = company
+    >>> move.unit_price = Decimal('1')
+    >>> move.currency = currency
+    >>> shipment_out.click('wait')
+
+Make 1 unit of the product available::
+
+    >>> incoming_move = StockMove()
+    >>> incoming_move.product = product
+    >>> incoming_move.uom = unit
+    >>> incoming_move.quantity = 1
+    >>> incoming_move.from_location = supplier_loc
+    >>> incoming_move.to_location = storage_loc
+    >>> incoming_move.planned_date = yesterday
+    >>> incoming_move.effective_date = yesterday
+    >>> incoming_move.company = company
+    >>> incoming_move.unit_price = Decimal('1')
+    >>> incoming_move.currency = currency
+    >>> incoming_move.save()
+    >>> StockMove.do([incoming_move.id], config.context)
+
+Finish the shipment::
+
+    >>> ShipmentOut.assign_try([shipment_out.id], config.context)
+    True
+    >>> shipment_out.click('pack')
+    >>> shipment_out.click('done')
+    >>> shipment_out.reload()
+    >>> shipment_out.state
+    u'done'
+    >>> outgoing_move, = shipment_out.outgoing_moves
+    >>> outgoing_move.effective_date == yesterday
+    True
+    >>> inventory_move, = shipment_out.inventory_moves
+    >>> inventory_move.effective_date == yesterday
+    True
+

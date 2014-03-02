@@ -1,5 +1,5 @@
 ========================
-Stock Average Cost Price
+Stock Inventory Scenario
 ========================
 
 =============
@@ -22,8 +22,8 @@ Create database::
 Install stock Module::
 
     >>> Module = Model.get('ir.module.module')
-    >>> modules = Module.find([('name', '=', 'stock')])
-    >>> Module.install([x.id for x in modules], config.context)
+    >>> stock_module, = Module.find([('name', '=', 'stock')])
+    >>> stock_module.click('install')
     >>> Wizard('ir.module.module.install_upgrade').execute('upgrade')
 
 Create company::
@@ -57,6 +57,12 @@ Reload the context::
     >>> User = Model.get('res.user')
     >>> config._context = User.get_preferences(True, config.context)
 
+Get stock locations::
+
+    >>> Location = Model.get('stock.location')
+    >>> supplier_loc, = Location.find([('code', '=', 'SUP')])
+    >>> storage_loc, = Location.find([('code', '=', 'STO')])
+
 Create product::
 
     >>> ProductUom = Model.get('product.uom')
@@ -75,13 +81,7 @@ Create product::
     >>> product.template = template
     >>> product.save()
 
-Get stock locations::
-
-    >>> Location = Model.get('stock.location')
-    >>> supplier_loc, = Location.find([('code', '=', 'SUP')])
-    >>> storage_loc, = Location.find([('code', '=', 'STO')])
-
-Make 1 unit of the product available @ 100 ::
+Fill storage::
 
     >>> StockMove = Model.get('stock.move')
     >>> incoming_move = StockMove()
@@ -96,32 +96,26 @@ Make 1 unit of the product available @ 100 ::
     >>> incoming_move.unit_price = Decimal('100')
     >>> incoming_move.currency = currency
     >>> incoming_move.save()
-    >>> StockMove.do([incoming_move.id], config.context)
+    >>> incoming_move.click('do')
 
-Check Cost Price is 100::
+Create an inventory::
 
-    >>> product.reload()
-    >>> product.template.cost_price
-    Decimal('100.0000')
-
-Add 1 more unit @ 200::
-
-    >>> incoming_move = StockMove()
-    >>> incoming_move.product = product
-    >>> incoming_move.uom = unit
-    >>> incoming_move.quantity = 1
-    >>> incoming_move.from_location = supplier_loc
-    >>> incoming_move.to_location = storage_loc
-    >>> incoming_move.planned_date = today
-    >>> incoming_move.effective_date = today
-    >>> incoming_move.company = company
-    >>> incoming_move.unit_price = Decimal('200')
-    >>> incoming_move.currency = currency
-    >>> incoming_move.save()
-    >>> StockMove.do([incoming_move.id], config.context)
-
-Check Cost Price Average is 150::
-
-    >>> product.reload()
-    >>> product.template.cost_price
-    Decimal('150.0000')
+    >>> Inventory = Model.get('stock.inventory')
+    >>> inventory = Inventory()
+    >>> inventory.location = storage_loc
+    >>> inventory.save()
+    >>> inventory.click('complete_lines')
+    >>> line, = inventory.lines
+    >>> line.expected_quantity == 1
+    True
+    >>> line.quantity = 2
+    >>> inventory.save()
+    >>> inventory.click('confirm')
+    >>> line.reload()
+    >>> move, = line.moves
+    >>> move.quantity == 1
+    True
+    >>> move.from_location == inventory.lost_found
+    True
+    >>> move.to_location == inventory.location
+    True

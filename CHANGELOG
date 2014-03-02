@@ -1,5 +1,10 @@
-Version 3.0.1 - 2014-01-18
-* Bug fixes (see mercurial logs for details)
+* Allow to define the effective date of shipments
+* Prevent changing product type if stock moves exist
+* Use new methods to compute quantities in StockMixin._search_quantity()
+* Split products_by_location into two methods on Move:
+  compute_quantities_query and compute_quantities
+* Use origin for inventory moves
+* Allow partial assignation on Supplier Shipment Return
 
 Version 3.0.0 - 2013-10-21
 * Bug fixes (see mercurial logs for details)

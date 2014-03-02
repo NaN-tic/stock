@@ -40,7 +40,11 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
     "Supplier Shipment"
     __name__ = 'stock.shipment.in'
     _rec_name = 'code'
-    effective_date = fields.Date('Effective Date', readonly=True)
+    effective_date = fields.Date('Effective Date',
+        states={
+            'readonly': Eval('state').in_(['cancel', 'done']),
+            },
+        depends=['state'])
     planned_date = fields.Date('Planned Date', states={
             'readonly': Not(Equal(Eval('state'), 'draft')),
             }, depends=['state'])
@@ -60,11 +64,11 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
     supplier = fields.Many2One('party.party', 'Supplier',
         states={
             'readonly': And(Or(Not(Equal(Eval('state'), 'draft')),
-                    Bool(Eval('incoming_moves'))), Bool(Eval('supplier'))),
-            }, on_change=['supplier'], required=True,
-        depends=['state', 'incoming_moves', 'supplier'])
+                    Bool(Eval('incoming_moves', [0]))), Bool(Eval('supplier'))),
+            }, required=True,
+        depends=['state', 'supplier'])
     supplier_location = fields.Function(fields.Many2One('stock.location',
-            'Supplier Location', on_change_with=['supplier']),
+            'Supplier Location'),
         'on_change_with_supplier_location')
     contact_address = fields.Many2One('party.address', 'Contact Address',
         states={
@@ -75,13 +79,13 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         required=True, domain=[('type', '=', 'warehouse')],
         states={
             'readonly': Or(In(Eval('state'), ['cancel', 'done']),
-                Bool(Eval('incoming_moves'))),
-            }, depends=['state', 'incoming_moves'])
+                Bool(Eval('incoming_moves', [0]))),
+            }, depends=['state'])
     warehouse_input = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Input', on_change_with=['warehouse']),
+            'Warehouse Input'),
         'on_change_with_warehouse_input')
     warehouse_storage = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Storage', on_change_with=['warehouse']),
+            'Warehouse Storage'),
         'on_change_with_warehouse_storage')
     incoming_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Incoming Moves',
@@ -259,12 +263,14 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
     def default_company():
         return Transaction().context.get('company')
 
+    @fields.depends('supplier')
     def on_change_supplier(self):
         address = None
         if self.supplier:
             address = self.supplier.address_get()
         return {'contact_address': address.id if address else None}
 
+    @fields.depends('supplier')
     def on_change_with_supplier_location(self, name=None):
         if self.supplier:
             return self.supplier.supplier_location.id
@@ -275,6 +281,7 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_input()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_input(self, name=None):
         if self.warehouse:
             return self.warehouse.input_location.id
@@ -285,6 +292,7 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_storage()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_storage(self, name=None):
         if self.warehouse:
             return self.warehouse.storage_location.id
@@ -375,9 +383,9 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         return shipments
 
     @classmethod
-    def write(cls, shipments, values):
-        super(ShipmentIn, cls).write(shipments, values)
-        cls._set_move_planned_date(shipments)
+    def write(cls, *args):
+        super(ShipmentIn, cls).write(*args)
+        cls._set_move_planned_date(sum(args[::2], []))
 
     @classmethod
     def copy(cls, shipments, default=None):
@@ -465,7 +473,7 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         Move = pool.get('stock.move')
         Date = pool.get('ir.date')
         Move.do([m for s in shipments for m in s.inventory_moves])
-        cls.write(shipments, {
+        cls.write([s for s in shipments if not s.effective_date], {
                 'effective_date': Date.today(),
                 })
 
@@ -474,7 +482,11 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
     "Supplier Return Shipment"
     __name__ = 'stock.shipment.in.return'
     _rec_name = 'code'
-    effective_date = fields.Date('Effective Date', readonly=True)
+    effective_date = fields.Date('Effective Date',
+        states={
+            'readonly': Eval('state').in_(['cancel', 'done']),
+            },
+        depends=['state'])
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Not(Equal(Eval('state'), 'draft')),
@@ -496,15 +508,15 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
     from_location = fields.Many2One('stock.location', "From Location",
         required=True, states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('moves'))),
+                Bool(Eval('moves', [0]))),
             }, domain=[('type', '=', 'storage')],
-        depends=['state', 'moves'])
+        depends=['state'])
     to_location = fields.Many2One('stock.location', "To Location",
         required=True, states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('moves'))),
+                Bool(Eval('moves', [0]))),
             }, domain=[('type', '=', 'supplier')],
-        depends=['state', 'moves'])
+        depends=['state'])
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         states={
             'readonly': And(Or(Not(Equal(Eval('state'), 'draft')),
@@ -672,9 +684,9 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         return shipments
 
     @classmethod
-    def write(cls, shipments, values):
-        super(ShipmentInReturn, cls).write(shipments, values)
-        cls._set_move_planned_date(shipments)
+    def write(cls, *args):
+        super(ShipmentInReturn, cls).write(*args)
+        cls._set_move_planned_date(sum(args[::2], []))
 
     @classmethod
     def delete(cls, shipments):
@@ -718,7 +730,7 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         Date = pool.get('ir.date')
 
         Move.do([m for s in shipments for m in s.moves])
-        cls.write(shipments, {
+        cls.write([s for s in shipments if not s.effective_date], {
                 'effective_date': Date.today(),
                 })
 
@@ -738,37 +750,13 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
     @ModelView.button
     def assign_try(cls, shipments):
         pool = Pool()
-        Product = pool.get('product.product')
-        Uom = pool.get('product.uom')
-        Date = pool.get('ir.date')
         Move = pool.get('stock.move')
-
-        Transaction().cursor.lock(Move._table)
-
-        moves = [m for s in shipments for m in s.moves]
-        location_ids = [m.from_location.id for m in moves]
-        with Transaction().set_context(
-                stock_date_end=Date.today(),
-                stock_assign=True):
-            pbl = Product.products_by_location(location_ids=location_ids,
-                product_ids=[m.product.id for m in moves])
-
-        for move in moves:
-            if move.state != 'draft':
-                continue
-            if (move.from_location.id, move.product.id) in pbl:
-                qty_default_uom = pbl[(move.from_location.id, move.product.id)]
-                qty = Uom.compute_qty(move.product.default_uom,
-                    qty_default_uom, move.uom, round=False)
-                if qty < move.quantity:
-                    return False
-                pbl[(move.from_location.id, move.product.id)] = (
-                    pbl[(move.from_location.id, move.product.id)]
-                    - qty_default_uom)
-            else:
-                return False
-        cls.assign(shipments)
-        return True
+        if Move.assign_try([m for s in shipments for m in s.moves],
+                with_childs=False):
+            cls.assign(shipments)
+            return True
+        else:
+            return False
 
     @classmethod
     @ModelView.button
@@ -780,7 +768,11 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
     "Customer Shipment"
     __name__ = 'stock.shipment.out'
     _rec_name = 'code'
-    effective_date = fields.Date('Effective Date', readonly=True)
+    effective_date = fields.Date('Effective Date',
+        states={
+            'readonly': Eval('state').in_(['cancel', 'done']),
+            },
+        depends=['state'])
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Not(Equal(Eval('state'), 'draft')),
@@ -797,12 +789,11 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
     customer = fields.Many2One('party.party', 'Customer', required=True,
         states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('outgoing_moves'))),
-            }, on_change=['customer'],
-        depends=['state', 'outgoing_moves'])
+                Bool(Eval('outgoing_moves', [0]))),
+            },
+        depends=['state'])
     customer_location = fields.Function(fields.Many2One('stock.location',
-            'Customer Location', on_change_with=['customer']),
-        'on_change_with_customer_location')
+            'Customer Location'), 'on_change_with_customer_location')
     delivery_address = fields.Many2One('party.address',
         'Delivery Address', required=True,
         states={
@@ -816,15 +807,13 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
     warehouse = fields.Many2One('stock.location', "Warehouse", required=True,
         states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('outgoing_moves'))),
+                Bool(Eval('outgoing_moves', [0]))),
             }, domain=[('type', '=', 'warehouse')],
-        depends=['state', 'outgoing_moves'])
+        depends=['state'])
     warehouse_storage = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Storage', on_change_with=['warehouse']),
-        'on_change_with_warehouse_storage')
+            'Warehouse Storage'), 'on_change_with_warehouse_storage')
     warehouse_output = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Output', on_change_with=['warehouse']),
-        'on_change_with_warehouse_output')
+            'Warehouse Output'), 'on_change_with_warehouse_output')
     outgoing_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Outgoing Moves',
             domain=[
@@ -990,12 +979,14 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
     def default_company():
         return Transaction().context.get('company')
 
+    @fields.depends('customer')
     def on_change_customer(self):
         address = None
         if self.customer:
             address = self.customer.address_get(type='delivery')
         return {'delivery_address': address.id if address else None}
 
+    @fields.depends('customer')
     def on_change_with_customer_location(self, name=None):
         if self.customer:
             return self.customer.customer_location.id
@@ -1006,6 +997,7 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_storage()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_storage(self, name=None):
         if self.warehouse:
             return self.warehouse.storage_location.id
@@ -1016,6 +1008,7 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_output()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_output(self, name=None):
         if self.warehouse:
             return self.warehouse.output_location.id
@@ -1194,7 +1187,7 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         Date = pool.get('ir.date')
 
         Move.do([m for s in shipments for m in s.outgoing_moves])
-        cls.write(shipments, {
+        cls.write([s for s in shipments if not s.effective_date], {
                 'effective_date': Date.today(),
                 })
 
@@ -1247,9 +1240,9 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         return shipments
 
     @classmethod
-    def write(cls, shipments, values):
-        super(ShipmentOut, cls).write(shipments, values)
-        cls._set_move_planned_date(shipments)
+    def write(cls, *args):
+        super(ShipmentOut, cls).write(*args)
+        cls._set_move_planned_date(sum(args[::2], []))
 
     @classmethod
     def copy(cls, shipments, default=None):
@@ -1312,7 +1305,11 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
     "Customer Return Shipment"
     __name__ = 'stock.shipment.out.return'
     _rec_name = 'code'
-    effective_date = fields.Date('Effective Date', readonly=True)
+    effective_date = fields.Date('Effective Date',
+        states={
+            'readonly': Eval('state').in_(['cancel', 'done']),
+            },
+        depends=['state'])
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Not(Equal(Eval('state'), 'draft')),
@@ -1329,12 +1326,11 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
     customer = fields.Many2One('party.party', 'Customer', required=True,
         states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('incoming_moves'))),
-            }, on_change=['customer'],
-        depends=['state', 'incoming_moves'])
+                Bool(Eval('incoming_moves', [0]))),
+            },
+        depends=['state'])
     customer_location = fields.Function(fields.Many2One('stock.location',
-            'Customer Location', on_change_with=['customer']),
-        'on_change_with_customer_location')
+            'Customer Location'), 'on_change_with_customer_location')
     delivery_address = fields.Many2One('party.address',
         'Delivery Address', required=True,
         states={
@@ -1348,15 +1344,13 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
     warehouse = fields.Many2One('stock.location', "Warehouse", required=True,
         states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('incoming_moves'))),
+                Bool(Eval('incoming_moves', [0]))),
             }, domain=[('type', '=', 'warehouse')],
-        depends=['state', 'incoming_moves'])
+        depends=['state'])
     warehouse_storage = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Storage', on_change_with=['warehouse']),
-        'on_change_with_warehouse_storage')
+            'Warehouse Storage'), 'on_change_with_warehouse_storage')
     warehouse_input = fields.Function(fields.Many2One('stock.location',
-            'Warehouse Input', on_change_with=['warehouse']),
-        'on_change_with_warehouse_input')
+            'Warehouse Input'), 'on_change_with_warehouse_input')
     incoming_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Incoming Moves',
             domain=[
@@ -1492,6 +1486,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
     def default_company():
         return Transaction().context.get('company')
 
+    @fields.depends('customer')
     def on_change_customer(self):
         address = None
         if self.customer:
@@ -1500,6 +1495,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
             'delivery_address': address.id if address else None,
             }
 
+    @fields.depends('customer')
     def on_change_with_customer_location(self, name=None):
         if self.customer:
             return self.customer.customer_location.id
@@ -1510,6 +1506,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_storage()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_storage(self, name=None):
         if self.warehouse:
             return self.warehouse.storage_location.id
@@ -1520,6 +1517,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         if warehouse:
             return cls(warehouse=warehouse).on_change_with_warehouse_input()
 
+    @fields.depends('warehouse')
     def on_change_with_warehouse_input(self, name=None):
         if self.warehouse:
             return self.warehouse.input_location.id
@@ -1605,9 +1603,9 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         return shipments
 
     @classmethod
-    def write(cls, shipments, values):
-        super(ShipmentOutReturn, cls).write(shipments, values)
-        cls._set_move_planned_date(shipments)
+    def write(cls, *args):
+        super(ShipmentOutReturn, cls).write(*args)
+        cls._set_move_planned_date(sum(args[::2], []))
 
     @classmethod
     def copy(cls, shipments, default=None):
@@ -1654,7 +1652,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         Move = pool.get('stock.move')
         Date = pool.get('ir.date')
         Move.do([m for s in shipments for m in s.inventory_moves])
-        cls.write(shipments, {
+        cls.write([s for s in shipments if not s.effective_date], {
                 'effective_date': Date.today(),
                 })
 
@@ -1752,7 +1750,11 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
     "Internal Shipment"
     __name__ = 'stock.shipment.internal'
     _rec_name = 'code'
-    effective_date = fields.Date('Effective Date', readonly=True)
+    effective_date = fields.Date('Effective Date',
+        states={
+            'readonly': Eval('state').in_(['cancel', 'done']),
+            },
+        depends=['state'])
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Not(Equal(Eval('state'), 'draft')),
@@ -1774,18 +1776,18 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
     from_location = fields.Many2One('stock.location', "From Location",
         required=True, states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('moves'))),
+                Bool(Eval('moves', [0]))),
             },
         domain=[
             ('type', 'in', ['storage', 'lost_found']),
-            ], depends=['state', 'moves'])
+            ], depends=['state'])
     to_location = fields.Many2One('stock.location', "To Location",
         required=True, states={
             'readonly': Or(Not(Equal(Eval('state'), 'draft')),
-                Bool(Eval('moves'))),
+                Bool(Eval('moves', [0]))),
             }, domain=[
             ('type', 'in', ['storage', 'lost_found']),
-            ], depends=['state', 'moves'])
+            ], depends=['state'])
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         states={
             'readonly': ((Eval('state') != 'draft')
@@ -1972,7 +1974,7 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
         Move = pool.get('stock.move')
         Date = pool.get('ir.date')
         Move.do([m for s in shipments for m in s.moves])
-        cls.write(shipments, {
+        cls.write([s for s in shipments if not s.effective_date], {
                 'effective_date': Date.today(),
                 })
 
